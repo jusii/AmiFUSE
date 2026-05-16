@@ -75,13 +75,19 @@ def _parse_fib(mem, fib_addr: int) -> Dict:
     """Decode a FileInfoBlock into a simple dict.
 
     Uses direct memory reads with known offsets from FileInfoBlockStruct:
-      fib_DiskKey: ULONG at 0
-      fib_DirEntryType: LONG at 4
-      fib_FileName: ARRAY(UBYTE,108) at 8
-      fib_Protection: LONG at 116
-      fib_EntryType: LONG at 120
-      fib_Size: ULONG at 124
-      fib_NumBlocks: LONG at 128
+      fib_DiskKey:       ULONG at 0
+      fib_DirEntryType:  LONG at 4
+      fib_FileName:      ARRAY(UBYTE,108) at 8
+      fib_Protection:    LONG at 116
+      fib_EntryType:     LONG at 120
+      fib_Size:          ULONG at 124
+      fib_NumBlocks:     LONG at 128
+      fib_Date:          DateStamp at 132  (3 LONGs: days, mins, ticks)
+      fib_Comment:       ARRAY(UBYTE,80) at 144  (BSTR: leading length byte)
+
+    The date and comment fields cost an extra few memory reads each call
+    but are essential for metadata-faithful copying — without them the
+    copy engine has nothing to feed apply_meta.
     """
     dir_type = mem.r32s(fib_addr + 4)   # fib_DirEntryType (signed LONG)
     protection = mem.r32(fib_addr + 116)  # fib_Protection (LONG)
@@ -90,12 +96,24 @@ def _parse_fib(mem, fib_addr: int) -> Dict:
     name_bytes = mem.r_block(fib_addr + 8, 108)  # fib_FileName starts at offset 8
     name_len = name_bytes[0]
     name = name_bytes[1 : 1 + name_len].decode("latin-1", errors="ignore")
+    # fib_Date — 3 LONGs at offset 132
+    date_days = mem.r32(fib_addr + 132)
+    date_mins = mem.r32(fib_addr + 136)
+    date_ticks = mem.r32(fib_addr + 140)
+    # fib_Comment — 80-byte BSTR at offset 144 (length byte then up to 79 chars)
+    comment_bytes = mem.r_block(fib_addr + 144, 80)
+    comment_len = min(comment_bytes[0], 79)
+    comment = comment_bytes[1 : 1 + comment_len].decode("latin-1", errors="ignore")
     return {
         "dir_type": dir_type,
         "size": size,
         "name": name,
         "protection": protection,
         "num_blocks": num_blocks,
+        "date_days": date_days,
+        "date_mins": date_mins,
+        "date_ticks": date_ticks,
+        "comment": comment,
     }
 
 
@@ -1451,6 +1469,32 @@ class HandlerBridge:
             if not replies:
                 return 0, -1
             return replies[-1][2], replies[-1][3]
+
+    def apply_meta_at_path(self, path: str, meta_info) -> None:
+        """Apply MetaInfo to *path*; resolves the parent lock internally.
+
+        Convenience wrapper around apply_meta() for callers that have a
+        full path rather than a parent_lock + name pair (the copy engine
+        is one such caller).
+        """
+        with self._lock:
+            parts = [p for p in path.split("/") if p]
+            if not parts:
+                raise ValueError(f"cannot apply_meta to root: {path!r}")
+            name = parts[-1]
+            dir_path = "/" + "/".join(parts[:-1]) if len(parts) > 1 else "/"
+            parent_lock, _, locks = self.locate_path(dir_path)
+            if dir_path == "/" and parent_lock == 0:
+                parent_lock, _ = self.locate(0, "")
+                if parent_lock:
+                    locks.append(parent_lock)
+            if parent_lock == 0:
+                raise FileNotFoundError(f"parent dir not found: {dir_path}")
+            try:
+                self.apply_meta(parent_lock, name, meta_info)
+            finally:
+                for l in reversed(locks):
+                    self.free_lock(l)
 
     def apply_meta(
         self,

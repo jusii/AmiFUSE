@@ -50,3 +50,11 @@ PFS3AIO = DRIVERS_DIR / "pfs3aio" if DRIVERS_DIR else None
 PFS3_HDF = READONLY_DIR / "pfs.hdf" if READONLY_DIR else None
 OFS_ADF = READONLY_DIR / "ofs.adf" if READONLY_DIR else None
 FFS_DRIVER = DRIVERS_DIR / "FastFileSystem" if DRIVERS_DIR else None
+
+# Additional cross-FS fixtures for Phase 6 copy-engine matrix.
+# These are skip-gated by existence checks in the integration fixtures.
+FFS_HDF = READONLY_DIR / "ffs.hdf" if READONLY_DIR else None
+SFS_DRIVER = DRIVERS_DIR / "SmartFilesystem" if DRIVERS_DIR else None
+SFS_HDF = READONLY_DIR / "sfs.hdf" if READONLY_DIR else None
+BFFS_DRIVER = DRIVERS_DIR / "BFFSFilesystem" if DRIVERS_DIR else None
+BFFS_HDF = READONLY_DIR / "bffs.hdf" if READONLY_DIR else None

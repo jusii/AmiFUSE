@@ -8,7 +8,18 @@ import time
 
 import pytest
 
-from tests.fixtures.paths import FIXTURE_ROOT, PFS3AIO, PFS3_HDF, OFS_ADF
+from tests.fixtures.paths import (
+    BFFS_DRIVER,
+    BFFS_HDF,
+    FFS_DRIVER,
+    FFS_HDF,
+    FIXTURE_ROOT,
+    OFS_ADF,
+    PFS3_HDF,
+    PFS3AIO,
+    SFS_DRIVER,
+    SFS_HDF,
+)
 
 
 _MOUNT_POLL_INTERVAL = 0.5   # seconds between ismount checks
@@ -94,6 +105,48 @@ def ofs_adf_image():
     if OFS_ADF is None or not OFS_ADF.exists():
         pytest.skip("OFS ADF image not found")
     return OFS_ADF
+
+
+@pytest.fixture(scope="session")
+def ffs_driver():
+    if FFS_DRIVER is None or not FFS_DRIVER.exists():
+        pytest.skip("FFS (FastFileSystem) handler not found")
+    return FFS_DRIVER
+
+
+@pytest.fixture(scope="session")
+def ffs_image():
+    if FFS_HDF is None or not FFS_HDF.exists():
+        pytest.skip("FFS test image not found")
+    return FFS_HDF
+
+
+@pytest.fixture(scope="session")
+def sfs_driver():
+    if SFS_DRIVER is None or not SFS_DRIVER.exists():
+        pytest.skip("SFS (SmartFilesystem) handler not found")
+    return SFS_DRIVER
+
+
+@pytest.fixture(scope="session")
+def sfs_image():
+    if SFS_HDF is None or not SFS_HDF.exists():
+        pytest.skip("SFS test image not found")
+    return SFS_HDF
+
+
+@pytest.fixture(scope="session")
+def bffs_driver():
+    if BFFS_DRIVER is None or not BFFS_DRIVER.exists():
+        pytest.skip("BFFS handler not found")
+    return BFFS_DRIVER
+
+
+@pytest.fixture(scope="session")
+def bffs_image():
+    if BFFS_HDF is None or not BFFS_HDF.exists():
+        pytest.skip("BFFS test image not found")
+    return BFFS_HDF
 
 
 @pytest.fixture(scope="session")

@@ -2891,6 +2891,38 @@ def _json_result(command: str, **kwargs) -> dict:
     return result
 
 
+def _parse_image_path(spec: str) -> Tuple[str, str]:
+    """Parse a ``<image>:<amiga-path>`` argument into (image, amiga_path).
+
+    The split is on the *last* colon so paths containing colons work for
+    typical Linux/macOS cases (Amiga paths use ``/``, no embedded colons).
+    On Windows, a drive-letter prefix like ``C:\\disk.hdf`` has its own
+    colon at offset 1; users should use forward-slash relative paths or
+    quote the argument if disambiguation is needed.
+
+    Raises SystemExit with a helpful error if the spec doesn't contain
+    a colon-separated path.
+    """
+    # Allow a single ":path" delimiter; require at least one colon other
+    # than a potential drive letter at offset 1.
+    if ":" not in spec:
+        raise SystemExit(
+            f"Error: missing ':path' in argument {spec!r}; expected "
+            f"<image>:<amiga-path>"
+        )
+    image_str, amiga_path = spec.rsplit(":", 1)
+    if not image_str:
+        raise SystemExit(
+            f"Error: empty image part in argument {spec!r}; expected "
+            f"<image>:<amiga-path>"
+        )
+    if not amiga_path:
+        amiga_path = "/"
+    if not amiga_path.startswith("/"):
+        amiga_path = "/" + amiga_path
+    return image_str, amiga_path
+
+
 def _cleanup_bridge(bridge, temp_driver=None):
     """Shut down a HandlerBridge and release all resources.
 
@@ -3496,15 +3528,54 @@ def cmd_read(args):
         finally:
             bridge.close_file(fh_addr)
 
+        # Optionally emit a metadata sidecar alongside the extracted file.
+        # Single-file extracts default to .uaem (best FS-UAE interop). Skips
+        # emission when the file has only-default metadata to avoid clutter.
+        sidecar_path = None
+        if getattr(args, "preserve", False) and not stdout_mode:
+            from .copy import meta_info_from_fib
+            from .sidecar import (
+                UaemProvider, XdfMetaProvider, is_default_meta,
+            )
+            meta_format = getattr(args, "meta_format", "uaem") or "uaem"
+            if meta_format == "auto":
+                meta_format = "uaem"
+            meta = meta_info_from_fib(stat)
+            if is_default_meta(meta):
+                sidecar_path = None  # nothing worth writing
+            else:
+                if meta_format == "uaem":
+                    provider = UaemProvider()
+                    out_path_obj = Path(out_path)
+                    provider.write_meta(out_path_obj, meta)
+                    sidecar_path = str(provider.sidecar_path_for(out_path_obj))
+                elif meta_format == "xdfmeta":
+                    # Single-file xdfmeta uses the output's parent as tree root.
+                    provider = XdfMetaProvider()
+                    out_path_obj = Path(out_path).resolve()
+                    tree_root = out_path_obj.parent
+                    provider.write_meta(out_path_obj, meta, tree_root)
+                    provider.set_volume_info(
+                        tree_root, volume_name=bridge.volume_name(),
+                    )
+                    provider.flush(tree_root)
+                    sidecar_path = str(provider.manifest_path_for(tree_root))
+                else:
+                    raise SystemExit(
+                        f"Error: unsupported --meta-format: {meta_format!r}"
+                    )
+
         if use_json:
-            result = _json_result("read",
+            payload = dict(
                 target=str(args.image),
                 file=file_path,
                 size=file_size,
                 bytes_read=bytes_read,
                 output="-" if stdout_mode else out_path,
             )
-            print(json.dumps(result, indent=2))
+            if sidecar_path is not None:
+                payload["sidecar"] = sidecar_path
+            print(json.dumps(_json_result("read", **payload), indent=2))
         else:
             if stdout_mode:
                 # Don't print metadata when outputting to stdout --
@@ -3515,6 +3586,8 @@ def cmd_read(args):
                 print(f"  Size: {file_size}")
                 print(f"  Bytes read: {bytes_read}")
                 print(f"  Output: {out_path}")
+                if sidecar_path is not None:
+                    print(f"  Sidecar: {sidecar_path}")
     except SystemExit:
         raise
     except Exception as e:
@@ -3646,20 +3719,92 @@ def cmd_write(args):
         bridge.flush_volume()
         flushed = True  # Mark as flushed to avoid double flush
 
+        # Optionally apply Amiga metadata from a sidecar alongside the host
+        # source file. ``auto`` walks the registry (xdfmeta beats uaem); a
+        # specific format requires its sidecar to be present. ``none`` skips.
+        meta_format = getattr(args, "meta_format", "auto") or "auto"
+        meta_from = getattr(args, "meta_from", None)
+        sidecar_applied = None
+        if meta_format != "none":
+            from .sidecar import (
+                SidecarRegistry, UaemProvider, XdfMetaProvider, default_registry,
+            )
+
+            meta = None
+            if meta_from:
+                # Caller pointed at an explicit metadata file. Detect format
+                # from its extension; .uaem is the only single-file format.
+                meta_path = Path(meta_from)
+                if not meta_path.exists():
+                    if use_json:
+                        print(json.dumps(_json_error(
+                            "write", "SIDECAR_NOT_FOUND",
+                            f"--meta-from path not found: {meta_path}")))
+                        sys.exit(1)
+                    raise SystemExit(f"Error: --meta-from not found: {meta_path}")
+                if meta_path.name.endswith(".uaem"):
+                    meta = UaemProvider()._codec.load_meta(str(meta_path))
+                else:
+                    raise SystemExit(
+                        f"Error: unrecognized --meta-from format: {meta_path}"
+                    )
+            else:
+                # Auto-detect using the registry, scoped to a chosen format.
+                if meta_format in ("auto",):
+                    reg = default_registry()
+                    match = reg.detect(host_path, tree_root=host_path.parent)
+                    if match is not None:
+                        _provider, meta = match
+                elif meta_format == "uaem":
+                    meta = UaemProvider().read_meta(host_path)
+                    if meta is None:
+                        if use_json:
+                            print(json.dumps(_json_error(
+                                "write", "SIDECAR_NOT_FOUND",
+                                f"--meta-format uaem requested but no .uaem alongside {host_path}")))
+                            sys.exit(1)
+                        raise SystemExit(
+                            f"Error: --meta-format uaem requested but no "
+                            f".uaem alongside {host_path}"
+                        )
+                elif meta_format == "xdfmeta":
+                    meta = XdfMetaProvider().read_meta(
+                        host_path, tree_root=host_path.parent
+                    )
+                    if meta is None:
+                        if use_json:
+                            print(json.dumps(_json_error(
+                                "write", "SIDECAR_NOT_FOUND",
+                                f"--meta-format xdfmeta requested but no matching manifest entry for {host_path}")))
+                            sys.exit(1)
+                        raise SystemExit(
+                            f"Error: --meta-format xdfmeta requested but no "
+                            f"matching manifest entry for {host_path}"
+                        )
+
+            if meta is not None:
+                bridge.apply_meta_at_path(normalized, meta)
+                bridge.flush_volume()
+                sidecar_applied = True
+
         if use_json:
-            result = _json_result("write",
+            payload = dict(
                 target=str(args.image),
                 file=amiga_path,
                 source=str(host_path),
                 size=host_size,
                 bytes_written=bytes_written,
             )
-            print(json.dumps(result, indent=2))
+            if sidecar_applied:
+                payload["sidecar_applied"] = True
+            print(json.dumps(_json_result("write", **payload), indent=2))
         else:
             print(f"Written: {amiga_path}")
             print(f"  Source: {host_path}")
             print(f"  Size: {host_size}")
             print(f"  Bytes written: {bytes_written}")
+            if sidecar_applied:
+                print(f"  Metadata applied from sidecar")
     except SystemExit:
         raise
     except Exception as e:
@@ -3678,6 +3823,169 @@ def cmd_write(args):
             except Exception:
                 pass
         _cleanup_bridge(bridge, temp_driver)
+
+
+def _build_side_args(args, side: str):
+    """Build a per-side argparse-like namespace for cp's two bridges.
+
+    Reads the global flags (image, partition, driver, block_size, debug)
+    and overlays any --src-* / --dst-* override. Returns (side_args,
+    amiga_path).
+    """
+    import argparse as _argparse
+
+    spec = getattr(args, side)
+    image_str, amiga_path = _parse_image_path(spec)
+    partition = getattr(args, f"{side}_partition", None) or args.partition
+    driver = getattr(args, f"{side}_driver", None) or args.driver
+    return (
+        _argparse.Namespace(
+            image=Path(image_str),
+            partition=partition,
+            driver=driver,
+            block_size=args.block_size,
+            debug=args.debug,
+            json=False,
+        ),
+        amiga_path,
+    )
+
+
+def cmd_cp(args):
+    """Handle the 'cp' subcommand: image-to-image file or tree copy."""
+    import json
+    from .copy import (
+        copy_file,
+        copy_tree,
+        DEFAULT_CHUNK_SIZE,
+        DEFAULT_MAX_FILENAME_LEN,
+    )
+
+    use_json = getattr(args, "json", False)
+
+    src_args, src_path = _build_side_args(args, "src")
+    dst_args, dst_path = _build_side_args(args, "dst")
+
+    # Validate per-side image existence early so we don't half-open one bridge.
+    for label, ns in (("source", src_args), ("destination", dst_args)):
+        if not ns.image.exists():
+            msg = f"{label} image not found: {ns.image}"
+            if use_json:
+                print(json.dumps(_json_error("cp", "IMAGE_NOT_FOUND", msg)))
+                sys.exit(1)
+            raise SystemExit(f"Error: {msg}")
+
+    # Translate conflict policy from flag triplet to copy_tree's string.
+    if getattr(args, "skip_existing", False):
+        on_conflict = "skip"
+    elif getattr(args, "error_on_existing", False):
+        on_conflict = "error"
+    else:
+        on_conflict = "overwrite"
+
+    preserve = getattr(args, "preserve", True)
+    atomic = getattr(args, "atomic", True)
+    on_error = getattr(args, "on_error", "abort")
+    chunk_size = getattr(args, "chunk_size", None) or DEFAULT_CHUNK_SIZE
+    max_filename_len = (
+        getattr(args, "max_filename_len", None) or DEFAULT_MAX_FILENAME_LEN
+    )
+
+    src_bridge = src_temp = dst_bridge = dst_temp = None
+    try:
+        src_bridge, src_temp = _create_bridge_from_args(
+            src_args, "cp", read_only=True
+        )
+        dst_bridge, dst_temp = _create_bridge_from_args(
+            dst_args, "cp", read_only=False
+        )
+
+        if args.recursive:
+            stats = copy_tree(
+                src_bridge, src_path,
+                dst_bridge, dst_path,
+                preserve=preserve,
+                atomic=atomic,
+                on_conflict=on_conflict,
+                on_error=on_error,
+                chunk_size=chunk_size,
+                max_filename_len=max_filename_len,
+            )
+        else:
+            overwrite = on_conflict == "overwrite"
+            if on_conflict == "skip":
+                # In single-file mode, "skip" means: skip if exists.
+                existing = dst_bridge.stat_path(dst_path)
+                if existing is not None:
+                    if use_json:
+                        print(json.dumps(_json_result(
+                            "cp", target=str(dst_args.image),
+                            src=src_path, dst=dst_path,
+                            skipped=True,
+                        ), indent=2))
+                    else:
+                        print(f"Skipped (exists): {dst_path}")
+                    return
+            stats = copy_file(
+                src_bridge, src_path,
+                dst_bridge, dst_path,
+                preserve=preserve,
+                atomic=atomic,
+                overwrite=overwrite,
+                chunk_size=chunk_size,
+            )
+
+        if use_json:
+            result = _json_result(
+                "cp",
+                src=f"{src_args.image}:{src_path}",
+                dst=f"{dst_args.image}:{dst_path}",
+                files_copied=stats.files_copied,
+                dirs_copied=stats.dirs_copied,
+                bytes_copied=stats.bytes_copied,
+                files_skipped=stats.files_skipped,
+                links_skipped=stats.links_skipped,
+                errors=stats.errors,
+                elapsed_secs=round(stats.elapsed_secs, 4),
+            )
+            print(json.dumps(result, indent=2))
+        else:
+            print(f"Copied: {src_args.image}:{src_path} -> {dst_args.image}:{dst_path}")
+            print(f"  Files copied: {stats.files_copied}")
+            if args.recursive:
+                print(f"  Dirs copied:  {stats.dirs_copied}")
+            print(f"  Bytes copied: {stats.bytes_copied:,}")
+            if stats.files_skipped:
+                print(f"  Files skipped: {stats.files_skipped}")
+            if stats.links_skipped:
+                print(f"  Links skipped: {stats.links_skipped}")
+            if stats.errors:
+                print(f"  Errors: {len(stats.errors)}")
+                for e in stats.errors[:5]:
+                    print(f"    - {e}")
+                if len(stats.errors) > 5:
+                    print(f"    ... and {len(stats.errors) - 5} more")
+            print(f"  Elapsed:      {stats.elapsed_secs:.3f}s")
+    except FileExistsError as exc:
+        if use_json:
+            print(json.dumps(_json_error("cp", "DESTINATION_EXISTS", str(exc))))
+            sys.exit(1)
+        raise SystemExit(f"Error: {exc}")
+    except (FileNotFoundError, NotADirectoryError, IsADirectoryError) as exc:
+        if use_json:
+            print(json.dumps(_json_error("cp", "PATH_ERROR", str(exc))))
+            sys.exit(1)
+        raise SystemExit(f"Error: {exc}")
+    except SystemExit:
+        raise
+    except Exception as exc:
+        if use_json:
+            print(json.dumps(_json_error("cp", "COPY_FAILED", str(exc))))
+            sys.exit(1)
+        raise SystemExit(f"Error during copy: {exc}")
+    finally:
+        _cleanup_bridge(dst_bridge, dst_temp)
+        _cleanup_bridge(src_bridge, src_temp)
 
 
 def cmd_inspect(args):
@@ -4551,6 +4859,22 @@ commands:
         help="Override block size (defaults to auto/512).",
     )
     read_parser.add_argument(
+        "--preserve", action="store_true",
+        help=(
+            "Emit a metadata sidecar (.uaem by default) alongside the "
+            "extracted file. Skipped automatically when the file has only "
+            "default protection / no comment / no timestamp."
+        ),
+    )
+    read_parser.add_argument(
+        "--meta-format", dest="meta_format",
+        choices=("auto", "uaem", "xdfmeta"), default="auto",
+        help=(
+            "Sidecar format when --preserve is set (default: auto → uaem "
+            "for single-file extract)."
+        ),
+    )
+    read_parser.add_argument(
         "--json", action="store_true",
         help="Output results as JSON.",
     )
@@ -4586,6 +4910,22 @@ commands:
         help="Override block size (defaults to auto/512).",
     )
     write_parser.add_argument(
+        "--meta-format", dest="meta_format",
+        choices=("auto", "uaem", "xdfmeta", "none"), default="auto",
+        help=(
+            "Sidecar lookup policy: auto (try registry; xdfmeta wins over "
+            "uaem); uaem/xdfmeta (require that specific format); none (skip "
+            "metadata entirely). Default: auto."
+        ),
+    )
+    write_parser.add_argument(
+        "--meta-from", dest="meta_from", type=str, default=None,
+        help=(
+            "Read metadata from an explicit sidecar path instead of "
+            "auto-detecting next to --in."
+        ),
+    )
+    write_parser.add_argument(
         "--json", action="store_true",
         help="Output results as JSON.",
     )
@@ -4594,6 +4934,111 @@ commands:
         help="Enable debug logging.",
     )
     write_parser.set_defaults(func=cmd_write)
+
+    # cp subcommand
+    cp_parser = subparsers.add_parser(
+        "cp",
+        help=(
+            "Copy a file (or tree with -r) between two Amiga filesystem "
+            "images, preserving metadata."
+        ),
+    )
+    cp_parser.add_argument(
+        "src",
+        type=str,
+        help="Source as <image>:<amiga-path> (e.g. src.hdf:/Sys/S/Startup-Sequence).",
+    )
+    cp_parser.add_argument(
+        "dst",
+        type=str,
+        help="Destination as <image>:<amiga-path>.",
+    )
+    cp_parser.add_argument(
+        "-r", "--recursive", action="store_true",
+        help="Recursively copy directories.",
+    )
+    cp_parser.add_argument(
+        "--preserve", dest="preserve", action="store_true", default=True,
+        help="Preserve Amiga protection/comment/datestamp (default).",
+    )
+    cp_parser.add_argument(
+        "--no-preserve", dest="preserve", action="store_false",
+        help="Skip metadata application (content-only copy).",
+    )
+    cp_parser.add_argument(
+        "--atomic", dest="atomic", action="store_true", default=True,
+        help="Write to a temp name and rename on completion (default).",
+    )
+    cp_parser.add_argument(
+        "--no-atomic", dest="atomic", action="store_false",
+        help="Write directly to the final name (faster but not crash-safe).",
+    )
+    conflict_group = cp_parser.add_mutually_exclusive_group()
+    conflict_group.add_argument(
+        "--overwrite", dest="overwrite", action="store_true", default=True,
+        help="Overwrite existing destination entries (default).",
+    )
+    conflict_group.add_argument(
+        "--skip-existing", dest="skip_existing", action="store_true",
+        help="Leave existing destination entries untouched.",
+    )
+    conflict_group.add_argument(
+        "--error-on-existing", dest="error_on_existing", action="store_true",
+        help="Fail if any destination entry already exists.",
+    )
+    cp_parser.add_argument(
+        "--on-error", choices=("abort", "skip"), default="abort",
+        help="Behavior when a single entry fails (default: abort).",
+    )
+    cp_parser.add_argument(
+        "--chunk-size", type=int, default=None,
+        help="I/O chunk size in bytes (default: 256 KiB).",
+    )
+    cp_parser.add_argument(
+        "--max-filename-len", type=int, default=None,
+        help=(
+            "Reject source names longer than this. Default 107 (PFS3/SFS); "
+            "set to 30 when targeting FFS."
+        ),
+    )
+    # Shared partition/driver flags (apply to both sides unless per-side is set)
+    cp_parser.add_argument(
+        "--partition", type=str, default=None,
+        help="Partition name or index for both src and dst (default: first).",
+    )
+    cp_parser.add_argument(
+        "--src-partition", type=str, default=None,
+        help="Override --partition for the source image.",
+    )
+    cp_parser.add_argument(
+        "--dst-partition", type=str, default=None,
+        help="Override --partition for the destination image.",
+    )
+    cp_parser.add_argument(
+        "--driver", type=Path, default=None,
+        help="Filesystem driver for both sides (default: extract from RDB).",
+    )
+    cp_parser.add_argument(
+        "--src-driver", type=Path, default=None,
+        help="Override --driver for the source image.",
+    )
+    cp_parser.add_argument(
+        "--dst-driver", type=Path, default=None,
+        help="Override --driver for the destination image.",
+    )
+    cp_parser.add_argument(
+        "--block-size", type=int, default=None,
+        help="Override block size for both images (default: auto/512).",
+    )
+    cp_parser.add_argument(
+        "--json", action="store_true",
+        help="Emit results as JSON.",
+    )
+    cp_parser.add_argument(
+        "--debug", action="store_true",
+        help="Enable debug logging.",
+    )
+    cp_parser.set_defaults(func=cmd_cp)
 
     args = parser.parse_args(argv)
     try:

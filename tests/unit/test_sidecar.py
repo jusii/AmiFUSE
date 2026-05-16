@@ -14,6 +14,8 @@ from amitools.fs.ProtectFlags import ProtectFlags
 from amitools.fs.TimeStamp import TimeStamp
 
 from amifuse.sidecar import (
+    AMIGA_JSON_SUFFIX,
+    JsonProvider,
     SidecarRegistry,
     UaemProvider,
     XdfMetaProvider,
@@ -259,6 +261,100 @@ class TestXdfMetaProvider:
 
 
 # ---------------------------------------------------------------------------
+# JsonProvider
+# ---------------------------------------------------------------------------
+
+
+class TestJsonProvider:
+    def test_sidecar_suffix_is_amiga_json(self, tmp_path):
+        provider = JsonProvider()
+        host_file = tmp_path / "Startup-Sequence"
+        assert provider.sidecar_path_for(host_file) == (
+            tmp_path / "Startup-Sequence.amiga.json"
+        )
+
+    def test_read_returns_none_when_sidecar_absent(self, tmp_path):
+        provider = JsonProvider()
+        host_file = tmp_path / "missing"
+        host_file.write_text("data")
+        assert provider.read_meta(host_file) is None
+
+    def test_roundtrip_preserves_metadata(self, tmp_path):
+        provider = JsonProvider()
+        host_file = tmp_path / "f"
+        host_file.touch()
+        original = _meta(mask=0x40, comment="Some note",
+                         days=5471, mins=720, ticks=1500)
+
+        provider.write_meta(host_file, original)
+        loaded = provider.read_meta(host_file)
+
+        assert loaded is not None
+        assert loaded.get_protect() == 0x40
+        assert loaded.get_comment_unicode_str() == "Some note"
+        ts = loaded.get_mod_ts()
+        assert (ts.days, ts.mins, ts.ticks) == (5471, 720, 1500)
+
+    def test_emits_human_readable_protection_string(self, tmp_path):
+        """The JSON file includes a HSPARWED string for editability."""
+        import json as _json
+
+        provider = JsonProvider()
+        host_file = tmp_path / "f"
+        host_file.touch()
+        provider.write_meta(host_file, _meta(mask=0x40, comment="x"))
+
+        sidecar = host_file.with_name("f.amiga.json")
+        data = _json.loads(sidecar.read_text())
+        assert "protection" in data
+        assert "protection_bits" in data
+        assert data["protection_bits"] == 0x40
+
+    def test_empty_comment_preserved(self, tmp_path):
+        provider = JsonProvider()
+        host_file = tmp_path / "f"
+        host_file.touch()
+        provider.write_meta(host_file, _meta(mask=0x10, comment=""))
+
+        loaded = provider.read_meta(host_file)
+        assert loaded.get_comment_unicode_str() == ""
+        assert loaded.get_protect() == 0x10
+
+    def test_latin1_comment_roundtrip(self, tmp_path):
+        provider = JsonProvider()
+        host_file = tmp_path / "f"
+        host_file.touch()
+        provider.write_meta(host_file, _meta(comment="Café & Müller"))
+
+        loaded = provider.read_meta(host_file)
+        assert loaded.get_comment_unicode_str() == "Café & Müller"
+
+    def test_flush_is_a_noop(self, tmp_path):
+        provider = JsonProvider()
+        provider.flush()
+        provider.flush(tmp_path)
+
+    def test_raw_bits_are_source_of_truth(self, tmp_path):
+        """If the human-readable string and the raw bits disagree, bits win."""
+        import json as _json
+
+        host_file = tmp_path / "f"
+        host_file.touch()
+        sidecar = host_file.with_name("f.amiga.json")
+        # Hand-craft a sidecar where "protection" says one thing and
+        # "protection_bits" says another. The parser must trust the bits.
+        sidecar.write_text(_json.dumps({
+            "protection": "BOGUS",
+            "protection_bits": 0x40,
+            "comment": "x",
+            "amiga_date": {"days": 1, "minutes": 1, "ticks": 50},
+        }))
+
+        meta = JsonProvider().read_meta(host_file)
+        assert meta.get_protect() == 0x40
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -274,7 +370,7 @@ class TestSidecarRegistry:
 
     def test_default_registry_lineup(self):
         reg = default_registry()
-        assert reg.names() == ["xdfmeta", "uaem"]
+        assert reg.names() == ["xdfmeta", "uaem", "json"]
 
     def test_by_name_returns_provider(self):
         reg = default_registry()
@@ -319,6 +415,34 @@ class TestSidecarRegistry:
         provider, meta = match
         assert provider.name == "uaem"
         assert meta.get_comment_unicode_str() == "only-uaem"
+
+    def test_detect_falls_through_to_json_as_last_resort(self, tmp_path):
+        """When neither xdfmeta nor uaem is present, json provider wins."""
+        host_file = tmp_path / "f"
+        host_file.touch()
+        JsonProvider().write_meta(
+            host_file, _meta(comment="only-json", mask=0x40),
+        )
+
+        reg = default_registry()
+        match = reg.detect(host_file, tmp_path)
+        assert match is not None
+        provider, meta = match
+        assert provider.name == "json"
+        assert meta.get_comment_unicode_str() == "only-json"
+        assert meta.get_protect() == 0x40
+
+    def test_detect_uaem_beats_json_when_both_present(self, tmp_path):
+        host_file = tmp_path / "f"
+        host_file.touch()
+        UaemProvider().write_meta(host_file, _meta(comment="from-uaem"))
+        JsonProvider().write_meta(host_file, _meta(comment="from-json"))
+
+        reg = default_registry()
+        match = reg.detect(host_file, tmp_path)
+        assert match is not None
+        assert match[0].name == "uaem"
+        assert match[1].get_comment_unicode_str() == "from-uaem"
 
     def test_detect_returns_none_when_no_sidecar(self, tmp_path):
         host_file = tmp_path / "naked"
@@ -387,6 +511,32 @@ class TestRoundTripExamples:
             f"comment mismatch ({description})"
         )
         ts = loaded.get_mod_ts()
+        assert (ts.days, ts.mins, ts.ticks) == (days, mins, ticks), (
+            f"timestamp mismatch ({description})"
+        )
+
+    @pytest.mark.parametrize(
+        "mask,comment,days,mins,ticks,description",
+        EXAMPLES,
+        ids=[e[-1] for e in EXAMPLES],
+    )
+    def test_json_roundtrip(self, tmp_path, mask, comment, days, mins, ticks, description):
+        provider = JsonProvider()
+        host_file = tmp_path / "f"
+        host_file.touch()
+
+        original = _meta(mask=mask, comment=comment,
+                         days=days, mins=mins, ticks=ticks)
+        provider.write_meta(host_file, original)
+        loaded = provider.read_meta(host_file)
+
+        assert loaded.get_protect() == mask, f"protect mismatch ({description})"
+        assert loaded.get_comment_unicode_str() == comment, (
+            f"comment mismatch ({description})"
+        )
+        ts = loaded.get_mod_ts()
+        # json stores the raw triple directly, so unlike .uaem this preserves
+        # sub-second ticks losslessly without the multiples-of-50 constraint.
         assert (ts.days, ts.mins, ts.ticks) == (days, mins, ticks), (
             f"timestamp mismatch ({description})"
         )

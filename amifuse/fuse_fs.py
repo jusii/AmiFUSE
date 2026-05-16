@@ -3551,7 +3551,7 @@ def _cmd_read_recursive(args):
         meta_format = "xdfmeta"
     if getattr(args, "manifest", False):
         meta_format = "xdfmeta"
-    if meta_format not in ("uaem", "xdfmeta"):
+    if meta_format not in ("uaem", "xdfmeta", "json"):
         msg = f"unsupported --meta-format for recursive read: {meta_format!r}"
         if use_json:
             print(json.dumps(_json_error("read", "INVALID_ARGUMENT", msg)))
@@ -3706,7 +3706,7 @@ def cmd_read(args):
         if getattr(args, "preserve", False) and not stdout_mode:
             from .copy import meta_info_from_fib
             from .sidecar import (
-                UaemProvider, XdfMetaProvider, is_default_meta,
+                JsonProvider, UaemProvider, XdfMetaProvider, is_default_meta,
             )
             meta_format = getattr(args, "meta_format", "uaem") or "uaem"
             if meta_format == "auto":
@@ -3717,6 +3717,11 @@ def cmd_read(args):
             else:
                 if meta_format == "uaem":
                     provider = UaemProvider()
+                    out_path_obj = Path(out_path)
+                    provider.write_meta(out_path_obj, meta)
+                    sidecar_path = str(provider.sidecar_path_for(out_path_obj))
+                elif meta_format == "json":
+                    provider = JsonProvider()
                     out_path_obj = Path(out_path)
                     provider.write_meta(out_path_obj, meta)
                     sidecar_path = str(provider.sidecar_path_for(out_path_obj))
@@ -3988,7 +3993,8 @@ def cmd_write(args):
         sidecar_applied = None
         if meta_format != "none":
             from .sidecar import (
-                SidecarRegistry, UaemProvider, XdfMetaProvider, default_registry,
+                JsonProvider, SidecarRegistry, UaemProvider,
+                XdfMetaProvider, default_registry,
             )
 
             meta = None
@@ -4005,6 +4011,11 @@ def cmd_write(args):
                     raise SystemExit(f"Error: --meta-from not found: {meta_path}")
                 if meta_path.name.endswith(".uaem"):
                     meta = UaemProvider()._codec.load_meta(str(meta_path))
+                elif meta_path.name.endswith(".amiga.json"):
+                    # JsonProvider.read_meta wants the *host file* path and
+                    # appends the suffix internally; here we pass it the
+                    # host_path so the sidecar matches the provided file.
+                    meta = JsonProvider().read_meta(host_path)
                 else:
                     raise SystemExit(
                         f"Error: unrecognized --meta-from format: {meta_path}"
@@ -4041,6 +4052,18 @@ def cmd_write(args):
                         raise SystemExit(
                             f"Error: --meta-format xdfmeta requested but no "
                             f"matching manifest entry for {host_path}"
+                        )
+                elif meta_format == "json":
+                    meta = JsonProvider().read_meta(host_path)
+                    if meta is None:
+                        if use_json:
+                            print(json.dumps(_json_error(
+                                "write", "SIDECAR_NOT_FOUND",
+                                f"--meta-format json requested but no .amiga.json alongside {host_path}")))
+                            sys.exit(1)
+                        raise SystemExit(
+                            f"Error: --meta-format json requested but no "
+                            f".amiga.json alongside {host_path}"
                         )
 
             if meta is not None:
@@ -5144,10 +5167,10 @@ commands:
     )
     read_parser.add_argument(
         "--meta-format", dest="meta_format",
-        choices=("auto", "uaem", "xdfmeta"), default="auto",
+        choices=("auto", "uaem", "xdfmeta", "json"), default="auto",
         help=(
             "Sidecar format when --preserve is set (default: auto → uaem "
-            "for single-file extract)."
+            "for single-file extract, xdfmeta for recursive)."
         ),
     )
     read_parser.add_argument(
@@ -5195,11 +5218,11 @@ commands:
     )
     write_parser.add_argument(
         "--meta-format", dest="meta_format",
-        choices=("auto", "uaem", "xdfmeta", "none"), default="auto",
+        choices=("auto", "uaem", "xdfmeta", "json", "none"), default="auto",
         help=(
             "Sidecar lookup policy: auto (try registry; xdfmeta wins over "
-            "uaem); uaem/xdfmeta (require that specific format); none (skip "
-            "metadata entirely). Default: auto."
+            "uaem wins over json); uaem/xdfmeta/json (require that specific "
+            "format); none (skip metadata entirely). Default: auto."
         ),
     )
     write_parser.add_argument(

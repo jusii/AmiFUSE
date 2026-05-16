@@ -39,6 +39,7 @@ from amitools.fs.TimeStamp import TimeStamp  # type: ignore
 
 
 XDFMETA_MANIFEST_NAME = ".amiga-meta.xdfmeta"
+AMIGA_JSON_SUFFIX = ".amiga.json"
 
 
 def is_default_meta(meta: MetaInfo) -> bool:
@@ -291,6 +292,110 @@ class XdfMetaProvider(SidecarProvider):
             del self._pending[root]
 
 
+class JsonProvider(SidecarProvider):
+    """Explicit, lossless JSON sidecar provider — AmiFUSE's own format.
+
+    Each file gets a ``<file>.amiga.json`` sidecar carrying every Amiga
+    metadata bit in a human-readable, diff-friendly JSON object. Useful
+    when you want to version-control an Amiga tree, edit metadata by
+    hand, or carry forward fields that .uaem and xdfmeta don't represent
+    (or that we might add later — the format is forward-extensible).
+
+    Schema::
+
+        {
+          "protection": "----rwed",      # human-readable HSPARWED form
+          "protection_bits": 0,          # raw FIBF mask, authoritative
+          "comment": "Some note",        # may be empty string
+          "date": "2023-06-28T12:38:26.50",  # ISO-ish, centisecond res
+          "amiga_date": {                # raw Amiga datestamp triple
+            "days": 16613,
+            "minutes": 758,
+            "ticks": 1330
+          }
+        }
+
+    The raw ``protection_bits`` and ``amiga_date`` are authoritative;
+    the human-readable strings are present for editability but ignored
+    on parse (we trust the bits/triple).
+    """
+
+    name = "json"
+    can_write = True
+    suffix = AMIGA_JSON_SUFFIX
+
+    def sidecar_path_for(self, host_file: Path) -> Path:
+        return host_file.with_name(host_file.name + self.suffix)
+
+    def read_meta(
+        self,
+        host_file: Path,
+        tree_root: Optional[Path] = None,
+    ) -> Optional[MetaInfo]:
+        import json as _json
+
+        sidecar = self.sidecar_path_for(host_file)
+        if not sidecar.exists():
+            return None
+        data = _json.loads(sidecar.read_text())
+
+        from amitools.fs.FSString import FSString  # type: ignore
+        from amitools.fs.ProtectFlags import ProtectFlags  # type: ignore
+
+        mask = int(data.get("protection_bits", 0))
+        protect = ProtectFlags(mask)
+
+        comment_text = data.get("comment", "")
+        comment = FSString(comment_text) if comment_text else None
+
+        ad = data.get("amiga_date") or {}
+        ts = TimeStamp(
+            days=int(ad.get("days", 0)),
+            mins=int(ad.get("minutes", 0)),
+            ticks=int(ad.get("ticks", 0)),
+        )
+        return MetaInfo(protect_flags=protect, mod_ts=ts, comment=comment)
+
+    def write_meta(
+        self,
+        host_file: Path,
+        meta: MetaInfo,
+        tree_root: Optional[Path] = None,
+    ) -> None:
+        import json as _json
+
+        mask = meta.get_protect() or 0
+        comment = meta.get_comment_unicode_str() or ""
+        ts = meta.get_mod_ts()
+        if ts is not None:
+            iso = str(ts).replace(" ", "T")  # "DD.MM.YYYY HH:MM:SS.cc" → keep amitools' format
+            amiga_date = {
+                "days": int(ts.days),
+                "minutes": int(ts.mins),
+                "ticks": int(ts.ticks),
+            }
+        else:
+            iso = None
+            amiga_date = {"days": 0, "minutes": 0, "ticks": 0}
+
+        # Human-readable HSPARWED string. Use amitools' formatter for
+        # consistency with .uaem; raw bits remain the source of truth.
+        from amitools.fs.ProtectFlags import ProtectFlags  # type: ignore
+        protect_str = str(ProtectFlags(mask))
+
+        payload = {
+            "protection": protect_str,
+            "protection_bits": int(mask),
+            "comment": comment,
+            "amiga_date": amiga_date,
+        }
+        if iso is not None:
+            payload["date"] = iso
+
+        sidecar = self.sidecar_path_for(host_file)
+        sidecar.write_text(_json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+
+
 @dataclass(order=True)
 class _RegistryEntry:
     priority: int
@@ -347,8 +452,19 @@ class SidecarRegistry:
 
 
 def default_registry() -> SidecarRegistry:
-    """Build a registry with the standard providers in their default order."""
+    """Build a registry with the standard providers in their default order.
+
+    Priority order on auto-detect:
+      10 = xdfmeta (per-volume manifest; explicit bulk choice)
+      20 = .uaem   (per-file FS-UAE-compatible)
+      30 = .amiga.json (per-file AmiFUSE-native JSON)
+
+    xdfmeta wins over .uaem when both are present for the same file
+    because the manifest is a more deliberate choice. .amiga.json sits
+    behind both — it's the explicit-and-lossless format users opt into.
+    """
     reg = SidecarRegistry()
     reg.register(XdfMetaProvider(), priority=10)
     reg.register(UaemProvider(), priority=20)
+    reg.register(JsonProvider(), priority=30)
     return reg

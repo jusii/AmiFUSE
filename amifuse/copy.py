@@ -761,12 +761,13 @@ def export_tree(
     *dst_path* is created if absent.
     """
     from .sidecar import (  # local import: amitools-dependent
+        JsonProvider,
         UaemProvider,
         XdfMetaProvider,
         is_default_meta,
     )
 
-    if meta_format not in ("uaem", "xdfmeta"):
+    if meta_format not in ("uaem", "xdfmeta", "json"):
         raise ValueError(f"invalid meta_format: {meta_format!r}")
     if on_error not in ("abort", "skip"):
         raise ValueError(f"invalid on_error: {on_error!r}")
@@ -783,7 +784,12 @@ def export_tree(
     dst_path = Path(dst_path).resolve()
     dst_path.mkdir(parents=True, exist_ok=True)
 
-    provider = UaemProvider() if meta_format == "uaem" else XdfMetaProvider()
+    if meta_format == "uaem":
+        provider = UaemProvider()
+    elif meta_format == "json":
+        provider = JsonProvider()
+    else:
+        provider = XdfMetaProvider()
 
     # Record the source root's metadata too. For xdfmeta this becomes a
     # manifest entry whose relative key is the root itself; for .uaem we
@@ -945,7 +951,9 @@ def _export_one_file(
     if preserve:
         meta = meta_info_from_fib(entry)
         if not is_default_meta(meta):
-            if meta_format == "uaem":
+            # Per-file providers (uaem, json) write standalone sidecars;
+            # per-volume provider (xdfmeta) buffers into the manifest.
+            if meta_format in ("uaem", "json"):
                 provider.write_meta(dst_path, meta)
             else:
                 provider.write_meta(dst_path, meta, tree_root)

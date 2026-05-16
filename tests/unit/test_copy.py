@@ -329,11 +329,16 @@ def _add_dir(bridge: FakeBridge, path: str, **meta):
 
 
 class TestMetaInfoFromFib:
-    def test_all_zero_date_returns_none_mod_ts(self):
+    def test_all_zero_date_returns_epoch_timestamp(self):
+        """All-zero date stays as the Amiga epoch (1978-01-01) — sidecar
+        formats need a parseable timestamp, and the is_default_meta
+        helper treats an epoch stamp as "no real date" anyway."""
         meta = meta_info_from_fib({"protection": 0, "date_days": 0,
                                    "date_mins": 0, "date_ticks": 0,
                                    "comment": ""})
-        assert meta.get_mod_ts() is None
+        ts = meta.get_mod_ts()
+        assert ts is not None
+        assert (ts.days, ts.mins, ts.ticks) == (0, 0, 0)
 
     def test_non_zero_date_builds_timestamp(self):
         meta = meta_info_from_fib({"protection": 0, "date_days": 5471,

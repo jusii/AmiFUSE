@@ -373,6 +373,74 @@ class TestReadPreserveSidecar:
         assert "s" in content[:8]
         assert "hello" in content
 
+    def test_recursive_read_extracts_tree_with_xdfmeta_manifest(
+        self, fuse_mock, monkeypatch, tmp_path
+    ):
+        """read -r --preserve produces a host tree with xdfmeta manifest by default."""
+        from amifuse import fuse_fs
+        from amifuse.sidecar import XDFMETA_MANIFEST_NAME, XdfMetaProvider
+
+        bridge = FakeBridge()
+        _add_dir(bridge, "/Sys")
+        _add_file(bridge, "/Sys/a", b"AAA",
+                  protection=0x40, comment="note-a",
+                  date_days=5471, date_mins=720, date_ticks=1500)
+        _add_dir(bridge, "/Sys/S")
+        _add_file(bridge, "/Sys/S/Startup-Sequence", b";; boot\n",
+                  protection=0x20, comment="boot script")
+
+        (tmp_path / "img.hdf").touch()
+        monkeypatch.setattr(
+            fuse_fs, "_create_bridge_from_args",
+            lambda a, c, read_only=True: (bridge, None),
+        )
+
+        out_dir = tmp_path / "out"
+        fuse_fs.main([
+            "read", str(tmp_path / "img.hdf"),
+            "-r", "--file", "/Sys", "--out", str(out_dir),
+            "--preserve",
+        ])
+
+        assert (out_dir / "a").read_bytes() == b"AAA"
+        assert (out_dir / "S" / "Startup-Sequence").read_bytes() == b";; boot\n"
+        # xdfmeta is the default for recursive extract
+        assert (out_dir / XDFMETA_MANIFEST_NAME).exists()
+
+        # Verify metadata is reachable via the manifest
+        provider = XdfMetaProvider()
+        meta_a = provider.read_meta(out_dir / "a", out_dir)
+        assert meta_a is not None
+        assert meta_a.get_protect() == 0x40
+        assert meta_a.get_comment_unicode_str() == "note-a"
+
+    def test_recursive_read_with_uaem_format(
+        self, fuse_mock, monkeypatch, tmp_path
+    ):
+        """read -r --preserve --meta-format uaem produces per-file sidecars instead."""
+        from amifuse import fuse_fs
+
+        bridge = FakeBridge()
+        _add_dir(bridge, "/d")
+        _add_file(bridge, "/d/file", b"x",
+                  protection=0x40, comment="hi")
+
+        (tmp_path / "img.hdf").touch()
+        monkeypatch.setattr(
+            fuse_fs, "_create_bridge_from_args",
+            lambda a, c, read_only=True: (bridge, None),
+        )
+
+        out_dir = tmp_path / "out"
+        fuse_fs.main([
+            "read", str(tmp_path / "img.hdf"),
+            "-r", "--file", "/d", "--out", str(out_dir),
+            "--preserve", "--meta-format", "uaem",
+        ])
+
+        assert (out_dir / "file").exists()
+        assert (out_dir / "file.uaem").exists()
+
     def test_no_sidecar_for_default_metadata(
         self, fuse_mock, monkeypatch, tmp_path
     ):
@@ -484,6 +552,49 @@ class TestWriteAppliesSidecar:
         assert bytes(node.data) == b"hi"
         assert node.protection == 0
         assert node.comment == ""
+
+    def test_recursive_write_imports_tree_with_sidecars(
+        self, fuse_mock, monkeypatch, tmp_path
+    ):
+        """write -r <host-dir> imports a tree, applying .uaem sidecars per file."""
+        from amifuse import fuse_fs
+        from amifuse.sidecar import UaemProvider
+        from amitools.fs.MetaInfo import MetaInfo
+        from amitools.fs.ProtectFlags import ProtectFlags
+        from amitools.fs.FSString import FSString
+        from amitools.fs.TimeStamp import TimeStamp
+
+        src = tmp_path / "extracted"
+        src.mkdir()
+        (src / "a").write_bytes(b"AAA")
+        UaemProvider().write_meta(src / "a", MetaInfo(
+            protect_flags=ProtectFlags(0x40),
+            mod_ts=TimeStamp(days=5471, mins=720, ticks=1500),
+            comment=FSString("note-a"),
+        ))
+        (src / "S").mkdir()
+        (src / "S" / "Startup-Sequence").write_bytes(b";; boot\n")
+
+        bridge = FakeBridge()
+        (tmp_path / "img.hdf").touch()
+        monkeypatch.setattr(
+            fuse_fs, "_create_bridge_from_args",
+            lambda a, c, read_only=True: (bridge, None),
+        )
+
+        fuse_fs.main([
+            "write", str(tmp_path / "img.hdf"),
+            "-r", "--file", "/Sys", "--in", str(src),
+        ])
+
+        sys_node = bridge.root.children["Sys"]
+        assert bytes(sys_node.children["a"].data) == b"AAA"
+        assert sys_node.children["a"].protection == 0x40
+        assert sys_node.children["a"].comment == "note-a"
+        # Sidecar .uaem was excluded from the import
+        assert "a.uaem" not in sys_node.children
+        assert "S" in sys_node.children
+        assert "Startup-Sequence" in sys_node.children["S"].children
 
     def test_meta_format_uaem_requires_sidecar_present(
         self, fuse_mock, monkeypatch, tmp_path

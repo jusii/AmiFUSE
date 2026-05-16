@@ -3441,9 +3441,96 @@ def _ensure_parent_dirs(bridge, path: str, use_json: bool = False, debug: bool =
                 bridge.free_lock(l)
 
 
+def _cmd_read_recursive(args):
+    """Recursive --file <amiga-dir> -> --out <host-dir> extraction with sidecars."""
+    import json
+    from .copy import export_tree
+
+    use_json = getattr(args, "json", False)
+    file_path = args.file
+    out_path = getattr(args, "out", None)
+    if out_path is None or out_path == "-":
+        if use_json:
+            print(json.dumps(_json_error(
+                "read", "INVALID_ARGUMENT",
+                "Recursive read (-r) requires --out <directory>.")))
+            sys.exit(1)
+        raise SystemExit(
+            "Error: recursive read (-r) requires --out <directory>."
+        )
+
+    meta_format = getattr(args, "meta_format", "auto") or "auto"
+    if meta_format == "auto":
+        # Recursive default differs from single-file default: xdfmeta scales
+        # better than thousands of .uaem files (and is the manifest mode
+        # the plan calls for on bulk extract).
+        meta_format = "xdfmeta"
+    if getattr(args, "manifest", False):
+        meta_format = "xdfmeta"
+    if meta_format not in ("uaem", "xdfmeta"):
+        msg = f"unsupported --meta-format for recursive read: {meta_format!r}"
+        if use_json:
+            print(json.dumps(_json_error("read", "INVALID_ARGUMENT", msg)))
+            sys.exit(1)
+        raise SystemExit(f"Error: {msg}")
+
+    bridge, temp_driver = _create_bridge_from_args(args, "read")
+    try:
+        normalized = "/" + file_path.lstrip("/")
+        stats = export_tree(
+            bridge, normalized,
+            Path(out_path),
+            preserve=getattr(args, "preserve", False),
+            meta_format=meta_format,
+        )
+        if use_json:
+            payload = dict(
+                target=str(args.image),
+                file=file_path,
+                output=str(out_path),
+                files_extracted=stats.files_copied,
+                dirs_extracted=stats.dirs_copied,
+                bytes_extracted=stats.bytes_copied,
+                links_skipped=stats.links_skipped,
+                meta_format=meta_format if getattr(args, "preserve", False) else None,
+                elapsed_secs=round(stats.elapsed_secs, 4),
+            )
+            print(json.dumps(_json_result("read", **payload), indent=2))
+        else:
+            print(f"Extracted: {file_path} -> {out_path}")
+            print(f"  Files: {stats.files_copied}")
+            print(f"  Dirs:  {stats.dirs_copied}")
+            print(f"  Bytes: {stats.bytes_copied:,}")
+            if getattr(args, "preserve", False):
+                print(f"  Sidecars: {meta_format}")
+            if stats.links_skipped:
+                print(f"  Links skipped: {stats.links_skipped}")
+            if stats.errors:
+                print(f"  Errors: {len(stats.errors)}")
+            print(f"  Elapsed:  {stats.elapsed_secs:.3f}s")
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        if use_json:
+            print(json.dumps(_json_error("read", "PATH_ERROR", str(exc))))
+            sys.exit(1)
+        raise SystemExit(f"Error: {exc}")
+    except SystemExit:
+        raise
+    except Exception as exc:
+        if use_json:
+            print(json.dumps(_json_error("read", "HANDLER_ERROR",
+                f"Recursive read failed: {exc}")))
+            sys.exit(1)
+        raise SystemExit(f"Error during recursive read: {exc}")
+    finally:
+        _cleanup_bridge(bridge, temp_driver)
+
+
 def cmd_read(args):
     """Handle the 'read' subcommand."""
     import json
+
+    if getattr(args, "recursive", False):
+        return _cmd_read_recursive(args)
 
     use_json = getattr(args, "json", False)
     file_path = args.file
@@ -3600,9 +3687,99 @@ def cmd_read(args):
         _cleanup_bridge(bridge, temp_driver)
 
 
+def _cmd_write_recursive(args):
+    """Recursive --in <host-dir> -> --file <amiga-dir> import with sidecar lookup."""
+    import json
+    from .copy import (
+        DEFAULT_CHUNK_SIZE,
+        DEFAULT_MAX_FILENAME_LEN,
+        import_tree,
+    )
+
+    use_json = getattr(args, "json", False)
+    amiga_path = args.file
+    host_path = Path(args.input)
+
+    if not host_path.exists():
+        msg = f"source host path not found: {host_path}"
+        if use_json:
+            print(json.dumps(_json_error("write", "SOURCE_NOT_FOUND", msg)))
+            sys.exit(1)
+        raise SystemExit(f"Error: {msg}")
+    if not host_path.is_dir():
+        msg = f"recursive write requires --in <directory>: {host_path}"
+        if use_json:
+            print(json.dumps(_json_error("write", "INVALID_ARGUMENT", msg)))
+            sys.exit(1)
+        raise SystemExit(f"Error: {msg}")
+
+    meta_format = getattr(args, "meta_format", "auto") or "auto"
+    preserve = meta_format != "none"
+
+    # Conflict policy: write currently doesn't expose a conflict flag, so
+    # default to overwrite for parity with the single-file path.
+    on_conflict = "overwrite"
+    chunk_size = getattr(args, "chunk_size", None) or DEFAULT_CHUNK_SIZE
+    max_filename_len = (
+        getattr(args, "max_filename_len", None) or DEFAULT_MAX_FILENAME_LEN
+    )
+
+    bridge, temp_driver = _create_bridge_from_args(args, "write", read_only=False)
+    try:
+        normalized = "/" + amiga_path.lstrip("/")
+        stats = import_tree(
+            host_path,
+            bridge,
+            normalized,
+            preserve=preserve,
+            atomic=True,
+            on_conflict=on_conflict,
+            chunk_size=chunk_size,
+            max_filename_len=max_filename_len,
+        )
+        if use_json:
+            payload = dict(
+                target=str(args.image),
+                file=amiga_path,
+                source=str(host_path),
+                files_imported=stats.files_copied,
+                dirs_imported=stats.dirs_copied,
+                bytes_imported=stats.bytes_copied,
+                links_skipped=stats.links_skipped,
+                elapsed_secs=round(stats.elapsed_secs, 4),
+            )
+            print(json.dumps(_json_result("write", **payload), indent=2))
+        else:
+            print(f"Imported: {host_path} -> {args.image}:{amiga_path}")
+            print(f"  Files: {stats.files_copied}")
+            print(f"  Dirs:  {stats.dirs_copied}")
+            print(f"  Bytes: {stats.bytes_copied:,}")
+            if stats.errors:
+                print(f"  Errors: {len(stats.errors)}")
+            print(f"  Elapsed:  {stats.elapsed_secs:.3f}s")
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        if use_json:
+            print(json.dumps(_json_error("write", "PATH_ERROR", str(exc))))
+            sys.exit(1)
+        raise SystemExit(f"Error: {exc}")
+    except SystemExit:
+        raise
+    except Exception as exc:
+        if use_json:
+            print(json.dumps(_json_error("write", "HANDLER_ERROR",
+                f"Recursive write failed: {exc}")))
+            sys.exit(1)
+        raise SystemExit(f"Error during recursive write: {exc}")
+    finally:
+        _cleanup_bridge(bridge, temp_driver)
+
+
 def cmd_write(args):
     """Handle the 'write' subcommand."""
     import json
+
+    if getattr(args, "recursive", False):
+        return _cmd_write_recursive(args)
 
     use_json = getattr(args, "json", False)
     debug = getattr(args, "debug", False)
@@ -4859,6 +5036,21 @@ commands:
         help="Override block size (defaults to auto/512).",
     )
     read_parser.add_argument(
+        "-r", "--recursive", action="store_true",
+        help=(
+            "Recursively extract a directory tree from the image into --out. "
+            "With --preserve, metadata is emitted as xdfmeta by default "
+            "(or .uaem per file via --meta-format uaem)."
+        ),
+    )
+    read_parser.add_argument(
+        "--manifest", action="store_true",
+        help=(
+            "Force xdfmeta single-manifest emission for recursive --preserve "
+            "extracts (default for -r)."
+        ),
+    )
+    read_parser.add_argument(
         "--preserve", action="store_true",
         help=(
             "Emit a metadata sidecar (.uaem by default) alongside the "
@@ -4908,6 +5100,14 @@ commands:
     write_parser.add_argument(
         "--block-size", type=int,
         help="Override block size (defaults to auto/512).",
+    )
+    write_parser.add_argument(
+        "-r", "--recursive", action="store_true",
+        help=(
+            "Recursively import a host directory tree into --file on the "
+            "image. Sidecars (.uaem, xdfmeta manifest) are auto-detected per "
+            "file unless --meta-format none is set."
+        ),
     )
     write_parser.add_argument(
         "--meta-format", dest="meta_format",

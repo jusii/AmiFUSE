@@ -45,21 +45,23 @@ def is_default_meta(meta: MetaInfo) -> bool:
     """Return True when *meta* carries nothing worth preserving.
 
     A file with all-default protection (``----rwed`` / FIBF mask 0), no
-    filenote comment, and no modification timestamp doesn't need a sidecar:
-    the host filesystem already captures equivalent state. This matches
-    FS-UAE's policy of only writing ``.uaem`` files when the file has
-    non-default metadata.
+    filenote comment, and an Amiga-epoch (or absent) modification
+    timestamp doesn't need a sidecar: the host filesystem already
+    captures equivalent state. This matches FS-UAE's policy of only
+    writing ``.uaem`` files when the file has non-default metadata.
 
-    Note: we don't compare the timestamp to "now" — a real Amiga datestamp
-    is meaningful even if it's recent. Only the *absence* of a timestamp
-    counts as default.
+    The all-zero ``TimeStamp(0, 0, 0)`` (Amiga epoch, 1978-01-01) is
+    treated as "no real date" — Amiga files in the wild don't have
+    this datestamp; it's the natural sentinel for handler-created
+    entries that never got an explicit date.
     """
     mask = meta.get_protect()
     if mask is not None and mask != 0:
         return False
     if meta.get_comment_unicode_str():
         return False
-    if meta.get_mod_ts() is not None:
+    ts = meta.get_mod_ts()
+    if ts is not None and (ts.days != 0 or ts.mins != 0 or ts.ticks != 0):
         return False
     return True
 

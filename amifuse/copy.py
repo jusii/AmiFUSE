@@ -27,6 +27,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 from amitools.fs.FSString import FSString  # type: ignore
@@ -92,19 +93,20 @@ def meta_info_from_fib(entry: Dict) -> MetaInfo:
 
     The dict must carry the fields _parse_fib produces after the Phase 3
     extension: ``protection``, ``date_days``, ``date_mins``, ``date_ticks``,
-    ``comment``. Empty comments are stored as None on the MetaInfo so that
-    apply_meta skips emitting an empty SET_COMMENT packet.
+    ``comment``. Empty comments stay None so apply_meta skips emitting an
+    empty SET_COMMENT packet.
+
+    A datestamp is always set on the result — an all-zero (days/mins/ticks)
+    input becomes a TimeStamp at the Amiga epoch (1978-01-01), which is
+    the natural sentinel for "never explicitly dated". Sidecar formats
+    (.uaem, xdfmeta) require a parseable timestamp, so we can't leave
+    mod_ts as None.
     """
     protect = ProtectFlags(entry.get("protection", 0))
     days = entry.get("date_days", 0)
     mins = entry.get("date_mins", 0)
     ticks = entry.get("date_ticks", 0)
-    # Treat an all-zero datestamp as "no timestamp set" — common on freshly
-    # created files where the handler hasn't filled in a real date.
-    if days == 0 and mins == 0 and ticks == 0:
-        ts = None
-    else:
-        ts = TimeStamp(days=days, mins=mins, ticks=ticks)
+    ts = TimeStamp(days=days, mins=mins, ticks=ticks)
     comment_text = entry.get("comment", "")
     comment = FSString(comment_text) if comment_text else None
     return MetaInfo(protect_flags=protect, mod_ts=ts, comment=comment)
@@ -626,3 +628,479 @@ def _rename_path(bridge, src_path: str, dst_path: str) -> None:
             bridge.free_lock(l)
         for l in reversed(dst_locks):
             bridge.free_lock(l)
+
+
+# ---------------------------------------------------------------------------
+# Image ↔ Host tree operations
+# ---------------------------------------------------------------------------
+
+
+def export_tree(
+    src_bridge,
+    src_root: str,
+    dst_path: Path,
+    *,
+    preserve: bool = True,
+    meta_format: str = "uaem",  # "uaem" | "xdfmeta"
+    on_progress: Optional[Callable[[CopyProgress], None]] = None,
+    on_error: str = "abort",
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+) -> CopyStats:
+    """Recursively extract *src_root* from an image to *dst_path* on the host.
+
+    Sidecars are emitted alongside files (per-file ``.uaem``) or as a single
+    ``.amiga-meta.xdfmeta`` manifest at the tree root, depending on
+    *meta_format*. The default-metadata heuristic skips sidecar emission
+    for files with no comment, default protection, and no timestamp.
+
+    *dst_path* is created if absent.
+    """
+    from .sidecar import (  # local import: amitools-dependent
+        UaemProvider,
+        XdfMetaProvider,
+        is_default_meta,
+    )
+
+    if meta_format not in ("uaem", "xdfmeta"):
+        raise ValueError(f"invalid meta_format: {meta_format!r}")
+    if on_error not in ("abort", "skip"):
+        raise ValueError(f"invalid on_error: {on_error!r}")
+
+    start = time.monotonic()
+    stats = CopyStats()
+
+    src_root_info = src_bridge.stat_path(src_root)
+    if src_root_info is None:
+        raise FileNotFoundError(f"source root not found: {src_root}")
+    if not _entry_is_dir(src_root_info):
+        raise NotADirectoryError(f"source root is not a directory: {src_root}")
+
+    dst_path = Path(dst_path).resolve()
+    dst_path.mkdir(parents=True, exist_ok=True)
+
+    provider = UaemProvider() if meta_format == "uaem" else XdfMetaProvider()
+
+    # Record the source root's metadata too. For xdfmeta this becomes a
+    # manifest entry whose relative key is the root itself; for .uaem we
+    # skip — directory-level uaem sidecars don't have an established
+    # naming convention.
+    if preserve:
+        root_meta = meta_info_from_fib(src_root_info)
+        if not is_default_meta(root_meta) and meta_format == "xdfmeta":
+            provider.write_meta(dst_path, root_meta, dst_path)
+
+    _export_dir_contents(
+        src_bridge,
+        src_root,
+        dst_path,
+        provider=provider,
+        meta_format=meta_format,
+        tree_root=dst_path,
+        stats=stats,
+        preserve=preserve,
+        on_progress=on_progress,
+        on_error=on_error,
+        chunk_size=chunk_size,
+    )
+
+    if meta_format == "xdfmeta" and preserve:
+        # Single-volume manifest needs at least the volume name and a
+        # placeholder root meta to be parseable when re-read.
+        try:
+            volume_name = src_bridge.volume_name()
+        except Exception:
+            volume_name = "Extracted"
+        provider.set_volume_info(dst_path, volume_name)
+        provider.flush(dst_path)
+
+    stats.elapsed_secs = time.monotonic() - start
+    return stats
+
+
+def _export_dir_contents(
+    src_bridge,
+    src_dir: str,
+    dst_dir: Path,
+    *,
+    provider,
+    meta_format: str,
+    tree_root: Path,
+    stats: CopyStats,
+    preserve: bool,
+    on_progress: Optional[Callable[[CopyProgress], None]],
+    on_error: str,
+    chunk_size: int,
+) -> None:
+    from .sidecar import is_default_meta
+
+    entries = src_bridge.list_dir_path(src_dir)
+    for entry in entries:
+        name = entry.get("name", "")
+        if not name:
+            continue
+
+        src_child = _posix_join(src_dir, name)
+        dst_child = dst_dir / name
+
+        if _entry_is_link(entry):
+            stats.links_skipped += 1
+            if on_progress is not None:
+                on_progress(CopyProgress(current_path=src_child, current_op="skip"))
+            continue
+
+        try:
+            if _entry_is_dir(entry):
+                dst_child.mkdir(parents=True, exist_ok=True)
+                stats.dirs_copied += 1
+                if preserve:
+                    meta = meta_info_from_fib(entry)
+                    if not is_default_meta(meta) and meta_format == "xdfmeta":
+                        provider.write_meta(dst_child, meta, tree_root)
+                if on_progress is not None:
+                    on_progress(CopyProgress(
+                        current_path=str(dst_child), current_op="mkdir",
+                    ))
+                _export_dir_contents(
+                    src_bridge,
+                    src_child,
+                    dst_child,
+                    provider=provider,
+                    meta_format=meta_format,
+                    tree_root=tree_root,
+                    stats=stats,
+                    preserve=preserve,
+                    on_progress=on_progress,
+                    on_error=on_error,
+                    chunk_size=chunk_size,
+                )
+            else:
+                _export_one_file(
+                    src_bridge,
+                    src_child,
+                    dst_child,
+                    entry=entry,
+                    provider=provider,
+                    meta_format=meta_format,
+                    tree_root=tree_root,
+                    stats=stats,
+                    preserve=preserve,
+                    on_progress=on_progress,
+                    chunk_size=chunk_size,
+                )
+        except Exception as exc:
+            stats.errors.append(f"{src_child}: {exc}")
+            if on_error == "abort":
+                raise
+
+
+def _export_one_file(
+    src_bridge,
+    src_path: str,
+    dst_path: Path,
+    *,
+    entry: Dict,
+    provider,
+    meta_format: str,
+    tree_root: Path,
+    stats: CopyStats,
+    preserve: bool,
+    on_progress: Optional[Callable[[CopyProgress], None]],
+    chunk_size: int,
+) -> None:
+    from .sidecar import is_default_meta
+
+    fh_result = src_bridge.open_file(src_path)
+    if fh_result is None:
+        raise OSError(f"failed to open source: {src_path}")
+    fh_addr, _ = fh_result
+    bytes_written = 0
+    try:
+        src_bridge.seek_handle(fh_addr, 0)
+        total = entry.get("size", 0)
+        with open(dst_path, "wb") as out_fd:
+            while True:
+                chunk = src_bridge.read_handle(fh_addr, chunk_size)
+                if not chunk:
+                    break
+                out_fd.write(chunk)
+                bytes_written += len(chunk)
+                if on_progress is not None:
+                    on_progress(CopyProgress(
+                        current_path=str(dst_path),
+                        current_op="copy",
+                        bytes_in_file=total,
+                        bytes_done_in_file=bytes_written,
+                    ))
+    finally:
+        src_bridge.close_file(fh_addr)
+
+    stats.files_copied += 1
+    stats.bytes_copied += bytes_written
+
+    if preserve:
+        meta = meta_info_from_fib(entry)
+        if not is_default_meta(meta):
+            if meta_format == "uaem":
+                provider.write_meta(dst_path, meta)
+            else:
+                provider.write_meta(dst_path, meta, tree_root)
+
+
+def import_tree(
+    src_path: Path,
+    dst_bridge,
+    dst_root: str,
+    *,
+    preserve: bool = True,
+    sidecar_registry=None,
+    atomic: bool = True,
+    on_conflict: str = "overwrite",
+    on_error: str = "abort",
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    max_filename_len: int = DEFAULT_MAX_FILENAME_LEN,
+    on_progress: Optional[Callable[[CopyProgress], None]] = None,
+) -> CopyStats:
+    """Recursively import a host tree at *src_path* into the image at *dst_root*.
+
+    Sidecars next to files are auto-detected via *sidecar_registry* (default:
+    :func:`amifuse.sidecar.default_registry`) and their metadata is applied
+    to the image entries. ``.uaem`` and ``.amiga-meta.xdfmeta`` sidecar files
+    themselves are excluded from the import — they are metadata about other
+    files, not files to copy into the image.
+    """
+    from .sidecar import default_registry, XDFMETA_MANIFEST_NAME
+
+    if on_conflict not in ("overwrite", "skip", "error"):
+        raise ValueError(f"invalid on_conflict: {on_conflict!r}")
+    if on_error not in ("abort", "skip"):
+        raise ValueError(f"invalid on_error: {on_error!r}")
+
+    src_path = Path(src_path).resolve()
+    if not src_path.exists():
+        raise FileNotFoundError(f"source path not found: {src_path}")
+    if not src_path.is_dir():
+        raise NotADirectoryError(f"source path is not a directory: {src_path}")
+
+    start = time.monotonic()
+    stats = CopyStats()
+    tree_root = src_path
+    reg = sidecar_registry or default_registry()
+
+    # Ensure dst_root exists on the image
+    dst_root_info = dst_bridge.stat_path(dst_root)
+    if dst_root_info is None:
+        _create_dir_path(dst_bridge, dst_root)
+    elif not _entry_is_dir(dst_root_info):
+        raise NotADirectoryError(
+            f"destination root exists and is not a directory: {dst_root}"
+        )
+
+    _import_dir_contents(
+        src_path,
+        dst_bridge,
+        dst_root,
+        registry=reg,
+        tree_root=tree_root,
+        stats=stats,
+        preserve=preserve,
+        atomic=atomic,
+        on_conflict=on_conflict,
+        on_error=on_error,
+        chunk_size=chunk_size,
+        max_filename_len=max_filename_len,
+        on_progress=on_progress,
+    )
+
+    dst_bridge.flush_volume()
+    stats.elapsed_secs = time.monotonic() - start
+    return stats
+
+
+def _is_sidecar_filename(name: str) -> bool:
+    """Return True for files that hold metadata about other files, not data."""
+    from .sidecar import XDFMETA_MANIFEST_NAME
+    if name == XDFMETA_MANIFEST_NAME:
+        return True
+    if name.endswith(".uaem"):
+        return True
+    return False
+
+
+def _import_dir_contents(
+    src_dir: Path,
+    dst_bridge,
+    dst_dir: str,
+    *,
+    registry,
+    tree_root: Path,
+    stats: CopyStats,
+    preserve: bool,
+    atomic: bool,
+    on_conflict: str,
+    on_error: str,
+    chunk_size: int,
+    max_filename_len: int,
+    on_progress: Optional[Callable[[CopyProgress], None]],
+) -> None:
+    for entry in sorted(src_dir.iterdir()):
+        name = entry.name
+        if _is_sidecar_filename(name):
+            continue
+        if len(name) > max_filename_len:
+            msg = (
+                f"filename exceeds destination FS limit "
+                f"({len(name)} > {max_filename_len}): {entry}"
+            )
+            stats.errors.append(msg)
+            if on_error == "abort":
+                raise OSError(msg)
+            continue
+
+        dst_child = _posix_join(dst_dir, name)
+
+        try:
+            if entry.is_dir():
+                existing = dst_bridge.stat_path(dst_child)
+                if existing is None:
+                    new_lock = _create_dir_under(dst_bridge, dst_dir, name)
+                    dst_bridge.free_lock(new_lock)
+                elif not _entry_is_dir(existing):
+                    raise FileExistsError(
+                        f"destination exists as file, source is dir: {dst_child}"
+                    )
+                # Apply metadata if a sidecar covers the directory
+                if preserve:
+                    match = registry.detect(entry, tree_root=tree_root)
+                    if match is not None:
+                        _, meta = match
+                        dst_bridge.apply_meta_at_path(dst_child, meta)
+                stats.dirs_copied += 1
+                if on_progress is not None:
+                    on_progress(CopyProgress(
+                        current_path=dst_child, current_op="mkdir",
+                    ))
+                _import_dir_contents(
+                    entry,
+                    dst_bridge,
+                    dst_child,
+                    registry=registry,
+                    tree_root=tree_root,
+                    stats=stats,
+                    preserve=preserve,
+                    atomic=atomic,
+                    on_conflict=on_conflict,
+                    on_error=on_error,
+                    chunk_size=chunk_size,
+                    max_filename_len=max_filename_len,
+                    on_progress=on_progress,
+                )
+            elif entry.is_file():
+                _import_one_file(
+                    entry,
+                    dst_bridge,
+                    dst_child,
+                    registry=registry,
+                    tree_root=tree_root,
+                    stats=stats,
+                    preserve=preserve,
+                    atomic=atomic,
+                    on_conflict=on_conflict,
+                    chunk_size=chunk_size,
+                    on_progress=on_progress,
+                )
+            # Skip other host entry types (symlinks, devices)
+        except FileExistsError:
+            raise
+        except Exception as exc:
+            stats.errors.append(f"{entry}: {exc}")
+            if on_error == "abort":
+                raise
+
+
+def _import_one_file(
+    src_path: Path,
+    dst_bridge,
+    dst_path: str,
+    *,
+    registry,
+    tree_root: Path,
+    stats: CopyStats,
+    preserve: bool,
+    atomic: bool,
+    on_conflict: str,
+    chunk_size: int,
+    on_progress: Optional[Callable[[CopyProgress], None]],
+) -> None:
+    existing = dst_bridge.stat_path(dst_path)
+    if existing is not None:
+        if on_conflict == "error":
+            raise FileExistsError(f"destination exists: {dst_path}")
+        if on_conflict == "skip":
+            stats.files_skipped += 1
+            if on_progress is not None:
+                on_progress(CopyProgress(current_path=dst_path, current_op="skip"))
+            return
+
+    # Write content
+    dst_dir, dst_name = _split_path(dst_path)
+    write_name = _temp_name(dst_name) if atomic else dst_name
+    write_path = _posix_join(dst_dir, write_name)
+
+    if atomic:
+        leftover = dst_bridge.stat_path(write_path)
+        if leftover is not None:
+            _unlink_path(dst_bridge, write_path)
+    if existing is not None and not atomic:
+        _unlink_path(dst_bridge, dst_path)
+
+    bytes_written = 0
+    src_size = src_path.stat().st_size
+
+    dst_fh_result = dst_bridge.open_file(
+        write_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    )
+    if dst_fh_result is None:
+        raise OSError(f"failed to open destination for write: {write_path}")
+    dst_fh, _ = dst_fh_result
+    try:
+        with open(src_path, "rb") as in_fd:
+            while True:
+                chunk = in_fd.read(chunk_size)
+                if not chunk:
+                    break
+                n = dst_bridge.write_handle(dst_fh, chunk)
+                if n < 0:
+                    raise OSError(
+                        f"write failed at offset {bytes_written} for {dst_path}"
+                    )
+                if n < len(chunk):
+                    raise OSError(
+                        f"partial write {n}/{len(chunk)} (disk full?) at "
+                        f"{bytes_written} for {dst_path}"
+                    )
+                bytes_written += n
+                if on_progress is not None:
+                    on_progress(CopyProgress(
+                        current_path=dst_path,
+                        current_op="copy",
+                        bytes_in_file=src_size,
+                        bytes_done_in_file=bytes_written,
+                    ))
+    finally:
+        dst_bridge.close_file(dst_fh)
+
+    # Apply metadata if sidecar covers this file
+    if preserve:
+        match = registry.detect(src_path, tree_root=tree_root)
+        if match is not None:
+            _, meta = match
+            dst_bridge.apply_meta_at_path(write_path, meta)
+
+    # Atomic rename
+    if atomic:
+        if existing is not None:
+            _unlink_path(dst_bridge, dst_path)
+        _rename_path(dst_bridge, write_path, dst_path)
+
+    stats.files_copied += 1
+    stats.bytes_copied += bytes_written

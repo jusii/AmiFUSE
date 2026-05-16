@@ -22,6 +22,7 @@ from amitools.vamos.libstructs.dos import (
     MessageStruct,
     ProcessStruct,
     FileHandleStruct,
+    DateStampStruct,
 )  # type: ignore
 from amitools.vamos.machine.regs import REG_A6, REG_A7, REG_D0  # type: ignore
 from amitools.vamos.task import Stack, ExecTask  # type: ignore
@@ -242,10 +243,13 @@ ACTION_FINDINPUT = 1005
 ACTION_FINDOUTPUT = 1006
 ACTION_DELETE_OBJECT = 16
 ACTION_RENAME_OBJECT = 17
+ACTION_SET_PROTECT = 21
 ACTION_CREATE_DIR = 22
 ACTION_FLUSH = 27
+ACTION_SET_COMMENT = 28
 ACTION_FORMAT = 1020
 ACTION_INHIBIT = 31
+ACTION_SET_DATE = 34
 OFFSET_BEGINNING = -1
 OFFSET_CURRENT = 0
 OFFSET_END = 1
@@ -1158,6 +1162,64 @@ class HandlerLauncher:
     def send_create_dir(self, state: HandlerLaunchState, lock_bptr: int, name_bptr: int):
         """ACTION_CREATE_DIR: create a directory, returns new lock in res1."""
         return self.send_packet(state, ACTION_CREATE_DIR, [lock_bptr, name_bptr])
+
+    def send_set_protect(
+        self,
+        state: HandlerLaunchState,
+        lock_bptr: int,
+        name_bptr: int,
+        mask: int,
+    ):
+        """ACTION_SET_PROTECT: set protection bits on a file or directory.
+
+        Packet layout: dp_Arg1=0 (reserved), dp_Arg2=parent lock,
+        dp_Arg3=BSTR name, dp_Arg4=protection mask.
+        Returns dp_Res1=DOSTRUE/DOSFALSE, dp_Res2=error code.
+        """
+        return self.send_packet(state, ACTION_SET_PROTECT, [0, lock_bptr, name_bptr, mask])
+
+    def send_set_comment(
+        self,
+        state: HandlerLaunchState,
+        lock_bptr: int,
+        name_bptr: int,
+        comment_bptr: int,
+    ):
+        """ACTION_SET_COMMENT: set the filenote comment on a file or directory.
+
+        Packet layout: dp_Arg1=0 (reserved), dp_Arg2=parent lock,
+        dp_Arg3=BSTR name, dp_Arg4=BSTR comment.
+        Returns dp_Res1=DOSTRUE/DOSFALSE, dp_Res2=error code.
+        """
+        return self.send_packet(
+            state, ACTION_SET_COMMENT, [0, lock_bptr, name_bptr, comment_bptr]
+        )
+
+    def send_set_date(
+        self,
+        state: HandlerLaunchState,
+        lock_bptr: int,
+        name_bptr: int,
+        days: int,
+        mins: int,
+        ticks: int,
+    ):
+        """ACTION_SET_DATE: set the modification timestamp on a file or directory.
+
+        Packet layout: dp_Arg1=0 (reserved), dp_Arg2=parent lock,
+        dp_Arg3=BSTR name, dp_Arg4=APTR DateStamp (3 LONGs: days, mins, ticks).
+        Returns dp_Res1=DOSTRUE/DOSFALSE, dp_Res2=error code.
+
+        The DateStamp struct is allocated per call from the handler's memory pool.
+        """
+        ds_mem = self.alloc.alloc_struct(DateStampStruct, label="SetDateStamp")
+        ds = DateStampStruct(self.mem, ds_mem.addr)
+        ds.ds_Days.val = days
+        ds.ds_Minute.val = mins
+        ds.ds_Tick.val = ticks
+        return self.send_packet(
+            state, ACTION_SET_DATE, [0, lock_bptr, name_bptr, ds_mem.addr]
+        )
 
     def send_read_handle(
         self, state: HandlerLaunchState, fh_addr: int, buf_addr: int, length_bytes: int

@@ -1389,6 +1389,108 @@ class HandlerBridge:
                 return 0, -1
             return replies[-1][2], replies[-1][3]
 
+    def set_protect(
+        self, parent_lock_bptr: int, name: str, mask: int
+    ) -> Tuple[int, int]:
+        """ACTION_SET_PROTECT: set Amiga protection bits on (parent, name).
+
+        Returns (res1, res2) where res1 is DOSTRUE/DOSFALSE and res2 is
+        the AmigaDOS error code on failure.
+        """
+        with self._lock:
+            _, name_bptr = self._alloc_bstr(name)
+            self.launcher.send_set_protect(
+                self.state, parent_lock_bptr, name_bptr, mask & 0xFFFFFFFF
+            )
+            replies = self._run_until_replies()
+            self._log_replies("set_protect", replies)
+            if not replies:
+                return 0, -1
+            return replies[-1][2], replies[-1][3]
+
+    def set_comment(
+        self, parent_lock_bptr: int, name: str, comment: str
+    ) -> Tuple[int, int]:
+        """ACTION_SET_COMMENT: set the filenote on (parent, name).
+
+        Comments are encoded as Latin-1 BSTRs. Pass an empty string to
+        clear an existing comment.
+        """
+        with self._lock:
+            _, name_bptr = self._alloc_bstr(name)
+            _, comment_bptr = self._alloc_bstr(comment)
+            self.launcher.send_set_comment(
+                self.state, parent_lock_bptr, name_bptr, comment_bptr
+            )
+            replies = self._run_until_replies()
+            self._log_replies("set_comment", replies)
+            if not replies:
+                return 0, -1
+            return replies[-1][2], replies[-1][3]
+
+    def set_date(
+        self,
+        parent_lock_bptr: int,
+        name: str,
+        days: int,
+        mins: int,
+        ticks: int,
+    ) -> Tuple[int, int]:
+        """ACTION_SET_DATE: set the modification timestamp on (parent, name).
+
+        The Amiga datestamp is a triple of (days since 1978-01-01,
+        minutes since midnight, ticks since minute start at 50 Hz).
+        """
+        with self._lock:
+            _, name_bptr = self._alloc_bstr(name)
+            self.launcher.send_set_date(
+                self.state, parent_lock_bptr, name_bptr, days, mins, ticks
+            )
+            replies = self._run_until_replies()
+            self._log_replies("set_date", replies)
+            if not replies:
+                return 0, -1
+            return replies[-1][2], replies[-1][3]
+
+    def apply_meta(
+        self,
+        parent_lock_bptr: int,
+        name: str,
+        meta_info,
+    ) -> None:
+        """Apply protection, comment, and timestamp from an amitools MetaInfo
+        to (parent, name) on this bridge.
+
+        Raises OSError on first failure naming the failing operation and the
+        AmigaDOS error code, so the copy engine can attribute it.
+
+        Accepts amitools.fs.MetaInfo.MetaInfo. Fields that are None on the
+        MetaInfo are skipped (e.g. no comment → no SET_COMMENT call).
+        """
+        mask = meta_info.get_protect()
+        if mask is not None:
+            res1, res2 = self.set_protect(parent_lock_bptr, name, mask)
+            if res1 == 0:
+                raise OSError(
+                    f"SET_PROTECT failed for {name!r}: res2={res2}"
+                )
+        comment = meta_info.get_comment_unicode_str()
+        if comment:
+            res1, res2 = self.set_comment(parent_lock_bptr, name, comment)
+            if res1 == 0:
+                raise OSError(
+                    f"SET_COMMENT failed for {name!r}: res2={res2}"
+                )
+        ts = meta_info.get_mod_ts()
+        if ts is not None:
+            res1, res2 = self.set_date(
+                parent_lock_bptr, name, ts.days, ts.mins, ts.ticks
+            )
+            if res1 == 0:
+                raise OSError(
+                    f"SET_DATE failed for {name!r}: res2={res2}"
+                )
+
     def close_file(self, fh_addr: int):
         with self._lock:
             self.launcher.send_end_handle(self.state, fh_addr)

@@ -212,3 +212,108 @@ class TestStdpktRingBuffer:
         assert launcher._stdpkt_ring[0] is old_mem
         assert launcher._stdpkt_sizes[0] == 32
         launcher.alloc.free_memory.assert_not_called()
+
+
+class TestMetaPacketSenders:
+    """Verify ACTION_SET_PROTECT/COMMENT/DATE packet senders marshal correctly."""
+
+    def _make_launcher(self):
+        from amifuse.startup_runner import HandlerLauncher
+
+        launcher = HandlerLauncher.__new__(HandlerLauncher)
+        launcher.alloc = MagicMock()
+        launcher.mem = MagicMock()
+        launcher.send_packet = MagicMock(return_value=(0xAABB, 0xCCDD))
+        return launcher
+
+    def _state(self):
+        return SimpleNamespace(port_addr=0x1000, reply_port_addr=0x2000)
+
+    def test_send_set_protect_uses_correct_action_and_arg_layout(self):
+        from amifuse.startup_runner import ACTION_SET_PROTECT
+
+        launcher = self._make_launcher()
+        state = self._state()
+
+        launcher.send_set_protect(state, 0xDEAD0000, 0xBEEF0000, 0x12345678)
+
+        launcher.send_packet.assert_called_once_with(
+            state,
+            ACTION_SET_PROTECT,
+            [0, 0xDEAD0000, 0xBEEF0000, 0x12345678],
+        )
+
+    def test_send_set_comment_uses_correct_action_and_arg_layout(self):
+        from amifuse.startup_runner import ACTION_SET_COMMENT
+
+        launcher = self._make_launcher()
+        state = self._state()
+
+        launcher.send_set_comment(state, 0xDEAD0000, 0xBEEF0000, 0xCAFE0000)
+
+        launcher.send_packet.assert_called_once_with(
+            state,
+            ACTION_SET_COMMENT,
+            [0, 0xDEAD0000, 0xBEEF0000, 0xCAFE0000],
+        )
+
+    def test_send_set_date_marshals_datestamp_struct(self, monkeypatch):
+        from amifuse import startup_runner
+        from amifuse.startup_runner import ACTION_SET_DATE
+
+        launcher = self._make_launcher()
+        state = self._state()
+
+        ds_addr = 0x4000
+        launcher.alloc.alloc_struct.return_value = SimpleNamespace(addr=ds_addr)
+
+        # Patch DateStampStruct to a recording stub.
+        class _Field:
+            def __init__(self):
+                self.val = None
+
+        class _RecordingDateStamp:
+            def __init__(self, mem, addr):
+                self.addr = addr
+                self.ds_Days = _Field()
+                self.ds_Minute = _Field()
+                self.ds_Tick = _Field()
+
+        monkeypatch.setattr(startup_runner, "DateStampStruct", _RecordingDateStamp)
+
+        # Capture the instance the sender constructs.
+        captured = {}
+        orig = _RecordingDateStamp.__init__
+
+        def capturing_init(self, mem, addr):
+            orig(self, mem, addr)
+            captured["instance"] = self
+
+        monkeypatch.setattr(_RecordingDateStamp, "__init__", capturing_init)
+
+        launcher.send_set_date(
+            state, 0xDEAD0000, 0xBEEF0000, days=5471, mins=720, ticks=1500
+        )
+
+        launcher.alloc.alloc_struct.assert_called_once()
+        ds = captured["instance"]
+        assert ds.ds_Days.val == 5471
+        assert ds.ds_Minute.val == 720
+        assert ds.ds_Tick.val == 1500
+        launcher.send_packet.assert_called_once_with(
+            state,
+            ACTION_SET_DATE,
+            [0, 0xDEAD0000, 0xBEEF0000, ds_addr],
+        )
+
+    def test_action_constants_have_canonical_values(self):
+        """Sanity-check the constants match the AmigaOS DOS packet numbers."""
+        from amifuse.startup_runner import (
+            ACTION_SET_PROTECT,
+            ACTION_SET_COMMENT,
+            ACTION_SET_DATE,
+        )
+
+        assert ACTION_SET_PROTECT == 21
+        assert ACTION_SET_COMMENT == 28
+        assert ACTION_SET_DATE == 34

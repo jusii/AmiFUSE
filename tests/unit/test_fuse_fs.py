@@ -3828,3 +3828,169 @@ class TestCreateBridgeReadOnlyParam:
         )
         fuse_fs_mod._create_bridge_from_args(args, "test", read_only=False)
         assert captured.get("read_only") is False
+
+
+class TestHandlerBridgeMetaOps:
+    """Verify the SET_PROTECT/COMMENT/DATE bridge wrappers and apply_meta."""
+
+    def _make_bridge(self, fuse_mock, reply=(0, 1, 1, 0)):
+        """Build a HandlerBridge stub with the just-enough wiring to call
+        set_protect/set_comment/set_date/apply_meta.
+
+        Returns (bridge, launcher_mock). The launcher mock records calls;
+        each bridge method returns (reply[2], reply[3]) = (res1, res2).
+        """
+        import threading
+        from amifuse.fuse_fs import HandlerBridge
+
+        bridge = HandlerBridge.__new__(HandlerBridge)
+        bridge._lock = threading.Lock()
+        bridge.state = SimpleNamespace()
+        bridge.launcher = MagicMock()
+        bridge._run_until_replies = MagicMock(return_value=[reply])
+        bridge._log_replies = MagicMock()
+        # _alloc_bstr returns (mem_obj, bstr_bptr); we just need a deterministic
+        # bptr for the test — capture the strings allocated so we can verify
+        # the order of allocations.
+        allocs = []
+        def alloc_bstr(text):
+            allocs.append(text)
+            # Different bptrs per call so we can distinguish them
+            return SimpleNamespace(addr=0), 0xB000 + 0x10 * len(allocs)
+        bridge._alloc_bstr = alloc_bstr
+        bridge._bstr_allocs = allocs  # exposed for tests
+        return bridge
+
+    def test_set_protect_sends_correct_packet_and_returns_reply(self, fuse_mock):
+        bridge = self._make_bridge(fuse_mock, reply=(0, 1, 1, 0))
+
+        res1, res2 = bridge.set_protect(0xDEADBEEF, "Startup-Sequence", 0x40)
+
+        assert res1 == 1
+        assert res2 == 0
+        bridge.launcher.send_set_protect.assert_called_once_with(
+            bridge.state, 0xDEADBEEF, 0xB010, 0x40
+        )
+        assert bridge._bstr_allocs == ["Startup-Sequence"]
+
+    def test_set_protect_masks_to_32_bits(self, fuse_mock):
+        """A negative-int mask from Python (e.g. sign-extended) is coerced to u32."""
+        bridge = self._make_bridge(fuse_mock)
+
+        bridge.set_protect(0x100, "f", -1)
+
+        bridge.launcher.send_set_protect.assert_called_once_with(
+            bridge.state, 0x100, 0xB010, 0xFFFFFFFF
+        )
+
+    def test_set_protect_returns_negative_res2_when_no_reply(self, fuse_mock):
+        bridge = self._make_bridge(fuse_mock)
+        bridge._run_until_replies = MagicMock(return_value=[])
+
+        res1, res2 = bridge.set_protect(0x100, "f", 0)
+
+        assert res1 == 0
+        assert res2 == -1
+
+    def test_set_comment_allocates_name_and_comment_bstrs(self, fuse_mock):
+        bridge = self._make_bridge(fuse_mock, reply=(0, 1, 1, 0))
+
+        res1, res2 = bridge.set_comment(0xDEAD0000, "README", "Some note")
+
+        assert (res1, res2) == (1, 0)
+        # First alloc is name, second is comment
+        assert bridge._bstr_allocs == ["README", "Some note"]
+        bridge.launcher.send_set_comment.assert_called_once_with(
+            bridge.state, 0xDEAD0000, 0xB010, 0xB020
+        )
+
+    def test_set_comment_empty_string_still_sends_packet(self, fuse_mock):
+        """Empty comment allocates an empty BSTR and clears any existing comment."""
+        bridge = self._make_bridge(fuse_mock)
+
+        bridge.set_comment(0x100, "f", "")
+
+        assert bridge._bstr_allocs == ["f", ""]
+        bridge.launcher.send_set_comment.assert_called_once()
+
+    def test_set_date_passes_days_mins_ticks_through(self, fuse_mock):
+        bridge = self._make_bridge(fuse_mock, reply=(0, 1, 1, 0))
+
+        res1, res2 = bridge.set_date(0xCAFE0000, "Startup-Sequence", 5471, 720, 1500)
+
+        assert (res1, res2) == (1, 0)
+        bridge.launcher.send_set_date.assert_called_once_with(
+            bridge.state, 0xCAFE0000, 0xB010, 5471, 720, 1500
+        )
+
+    def _stub_meta(self, mask=0, comment="", ts=None):
+        """Build a minimal stand-in for amitools.fs.MetaInfo.MetaInfo.
+
+        apply_meta only calls get_protect(), get_comment_unicode_str(), and
+        get_mod_ts(); the rest of the MetaInfo surface is irrelevant here.
+        Using a stub keeps these tests independent of the real amitools
+        package (which the fuse_mock fixture stubs out).
+        """
+        return SimpleNamespace(
+            get_protect=lambda: mask,
+            get_comment_unicode_str=lambda: comment,
+            get_mod_ts=lambda: ts,
+        )
+
+    def test_apply_meta_calls_all_three_for_full_metainfo(self, fuse_mock):
+        bridge = self._make_bridge(fuse_mock, reply=(0, 1, 1, 0))
+
+        ts = SimpleNamespace(days=5471, mins=720, ticks=1500)
+        meta = self._stub_meta(mask=0x40, comment="Some note", ts=ts)
+
+        bridge.apply_meta(0x100, "Startup-Sequence", meta)
+
+        bridge.launcher.send_set_protect.assert_called_once()
+        bridge.launcher.send_set_comment.assert_called_once()
+        bridge.launcher.send_set_date.assert_called_once()
+
+    def test_apply_meta_skips_comment_when_empty(self, fuse_mock):
+        bridge = self._make_bridge(fuse_mock, reply=(0, 1, 1, 0))
+
+        ts = SimpleNamespace(days=1, mins=0, ticks=0)
+        meta = self._stub_meta(mask=0, comment="", ts=ts)
+
+        bridge.apply_meta(0x100, "f", meta)
+
+        bridge.launcher.send_set_protect.assert_called_once()
+        bridge.launcher.send_set_comment.assert_not_called()
+        bridge.launcher.send_set_date.assert_called_once()
+
+    def test_apply_meta_skips_date_when_no_mod_ts(self, fuse_mock):
+        bridge = self._make_bridge(fuse_mock, reply=(0, 1, 1, 0))
+
+        meta = self._stub_meta(mask=0, comment="", ts=None)
+
+        bridge.apply_meta(0x100, "f", meta)
+
+        bridge.launcher.send_set_protect.assert_called_once()
+        bridge.launcher.send_set_date.assert_not_called()
+
+    def test_apply_meta_skips_protect_when_mask_is_none(self, fuse_mock):
+        bridge = self._make_bridge(fuse_mock, reply=(0, 1, 1, 0))
+
+        meta = self._stub_meta(mask=None, comment="", ts=None)
+
+        bridge.apply_meta(0x100, "f", meta)
+
+        bridge.launcher.send_set_protect.assert_not_called()
+
+    def test_apply_meta_raises_on_first_failure(self, fuse_mock):
+        # First reply (set_protect) returns res1=0 → failure
+        bridge = self._make_bridge(fuse_mock, reply=(0, 1, 0, 205))
+
+        ts = SimpleNamespace(days=1, mins=0, ticks=0)
+        meta = self._stub_meta(mask=0, comment="note", ts=ts)
+
+        with pytest.raises(OSError, match="SET_PROTECT failed"):
+            bridge.apply_meta(0x100, "locked-file", meta)
+
+        # Should not have proceeded past the failure
+        bridge.launcher.send_set_protect.assert_called_once()
+        bridge.launcher.send_set_comment.assert_not_called()
+        bridge.launcher.send_set_date.assert_not_called()

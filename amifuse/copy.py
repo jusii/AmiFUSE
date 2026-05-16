@@ -68,6 +68,7 @@ class CopyStats:
     bytes_copied: int = 0
     files_skipped: int = 0
     links_skipped: int = 0
+    links_copied: int = 0
     errors: List[str] = field(default_factory=list)
     elapsed_secs: float = 0.0
 
@@ -167,6 +168,7 @@ def copy_file(
     preserve: bool = True,
     atomic: bool = True,
     overwrite: bool = True,
+    copy_links: bool = True,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     on_progress: Optional[Callable[[CopyProgress], None]] = None,
 ) -> CopyStats:
@@ -178,6 +180,9 @@ def copy_file(
     overwrite=False raises FileExistsError if dst exists.
     atomic=True writes to a temp file and renames atomically on success.
     preserve=True applies protection/comment/datestamp via apply_meta.
+    copy_links=True copies soft links via read_link/make_link; False skips.
+    Hard links are always skipped (ACTION_MAKE_LINK for hard links needs
+    cross-image lock translation, out of MVP scope).
     """
     start = time.monotonic()
     stats = CopyStats()
@@ -188,7 +193,21 @@ def copy_file(
     if _entry_is_dir(src_info):
         raise IsADirectoryError(f"source is a directory: {src_path}")
     if _entry_is_link(src_info):
-        stats.links_skipped += 1
+        if copy_links and src_info.get("dir_type") == ST_SOFTLINK:
+            src_dir, src_name = _split_path(src_path)
+            dst_dir, dst_name = _split_path(dst_path)
+            existing = dst_bridge.stat_path(dst_path)
+            if existing is not None and not overwrite:
+                raise FileExistsError(f"destination exists: {dst_path}")
+            _copy_one_softlink(
+                src_bridge, src_dir, src_name,
+                dst_bridge, dst_dir, dst_path,
+                stats=stats,
+                on_conflict="overwrite" if overwrite else "error",
+                on_progress=on_progress,
+            )
+        else:
+            stats.links_skipped += 1
         stats.elapsed_secs = time.monotonic() - start
         return stats
 
@@ -289,6 +308,7 @@ def copy_tree(
     *,
     preserve: bool = True,
     atomic: bool = True,
+    copy_links: bool = True,
     on_conflict: str = "overwrite",  # "overwrite" | "skip" | "error"
     on_error: str = "abort",  # "abort" | "skip"
     chunk_size: int = DEFAULT_CHUNK_SIZE,
@@ -345,6 +365,7 @@ def copy_tree(
         stats=stats,
         preserve=preserve,
         atomic=atomic,
+        copy_links=copy_links,
         on_conflict=on_conflict,
         on_error=on_error,
         chunk_size=chunk_size,
@@ -371,6 +392,7 @@ def _copy_dir_contents(
     stats: CopyStats,
     preserve: bool,
     atomic: bool,
+    copy_links: bool,
     on_conflict: str,
     on_error: str,
     chunk_size: int,
@@ -396,11 +418,30 @@ def _copy_dir_contents(
         dst_child = _posix_join(dst_dir, name)
 
         if _entry_is_link(entry):
-            stats.links_skipped += 1
-            if on_progress is not None:
-                on_progress(
-                    CopyProgress(current_path=src_child, current_op="skip")
+            if not copy_links or entry.get("dir_type") != ST_SOFTLINK:
+                # Skip hard links (ST_LINKDIR/ST_LINKFILE) — ACTION_MAKE_LINK
+                # for hard links requires a lock on the source object, which
+                # needs translation across images. Not in MVP scope.
+                stats.links_skipped += 1
+                if on_progress is not None:
+                    on_progress(
+                        CopyProgress(current_path=src_child, current_op="skip")
+                    )
+                continue
+            try:
+                _copy_one_softlink(
+                    src_bridge, src_dir, name,
+                    dst_bridge, dst_dir, dst_child,
+                    stats=stats,
+                    on_conflict=on_conflict,
+                    on_progress=on_progress,
                 )
+            except FileExistsError:
+                raise
+            except Exception as exc:
+                stats.errors.append(f"{src_child}: {exc}")
+                if on_error == "abort":
+                    raise
             continue
 
         is_dir = _entry_is_dir(entry)
@@ -413,6 +454,7 @@ def _copy_dir_contents(
                     stats=stats,
                     preserve=preserve,
                     atomic=atomic,
+                    copy_links=copy_links,
                     on_conflict=on_conflict,
                     on_error=on_error,
                     chunk_size=chunk_size,
@@ -438,6 +480,67 @@ def _copy_dir_contents(
                 raise
 
 
+def _copy_one_softlink(
+    src_bridge, src_dir, name,
+    dst_bridge, dst_dir, dst_path,
+    *,
+    stats: CopyStats,
+    on_conflict: str,
+    on_progress: Optional[Callable[[CopyProgress], None]],
+) -> None:
+    """Copy a single Amiga soft link.
+
+    Reads the target string via ACTION_READ_LINK on src and recreates the
+    link via ACTION_MAKE_LINK on dst. The target string is preserved
+    verbatim — if the link references a volume name that differs between
+    src and dst images, the resulting link may dangle on the destination.
+    Callers needing volume remapping must do it before/after the copy.
+    """
+    src_parent_lock, _, src_locks = src_bridge.locate_path(src_dir)
+    if src_parent_lock == 0 and src_dir != "/":
+        raise OSError(f"source parent not found: {src_dir}")
+    try:
+        target = src_bridge.read_link(src_parent_lock, name)
+    finally:
+        for l in reversed(src_locks):
+            src_bridge.free_lock(l)
+    if target is None:
+        raise OSError(f"failed to read link target for {_posix_join(src_dir, name)}")
+
+    # Conflict policy
+    existing = dst_bridge.stat_path(dst_path)
+    if existing is not None:
+        if on_conflict == "error":
+            raise FileExistsError(f"destination exists: {dst_path}")
+        if on_conflict == "skip":
+            stats.files_skipped += 1
+            if on_progress is not None:
+                on_progress(CopyProgress(current_path=dst_path, current_op="skip"))
+            return
+        # overwrite: unlink the existing entry first
+        _unlink_path(dst_bridge, dst_path)
+
+    # Make the link on dst
+    dst_parent_lock, _, dst_locks = dst_bridge.locate_path(dst_dir)
+    if dst_parent_lock == 0 and dst_dir != "/":
+        raise OSError(f"destination parent not found: {dst_dir}")
+    try:
+        res1, res2 = dst_bridge.make_link(
+            dst_parent_lock, name, target, soft=True,
+        )
+        if res1 == 0:
+            raise OSError(
+                f"make_link failed for {dst_path} -> {target!r}: res2={res2}"
+            )
+    finally:
+        for l in reversed(dst_locks):
+            dst_bridge.free_lock(l)
+
+    stats.links_copied += 1
+    if on_progress is not None:
+        on_progress(CopyProgress(current_path=dst_path, current_op="link"))
+
+
 def _copy_one_dir(
     src_bridge, src_path,
     dst_bridge, dst_parent, name, dst_path,
@@ -446,6 +549,7 @@ def _copy_one_dir(
     stats: CopyStats,
     preserve: bool,
     atomic: bool,
+    copy_links: bool,
     on_conflict: str,
     on_error: str,
     chunk_size: int,
@@ -491,6 +595,7 @@ def _copy_one_dir(
         stats=stats,
         preserve=preserve,
         atomic=atomic,
+        copy_links=copy_links,
         on_conflict=on_conflict,
         on_error=on_error,
         chunk_size=chunk_size,

@@ -52,6 +52,8 @@ class FakeNode:
     date_mins: int = 0
     date_ticks: int = 0
     children: Dict[str, "FakeNode"] = field(default_factory=dict)
+    # Soft link target (only populated when dir_type == ST_SOFTLINK)
+    link_target: str = ""
 
 
 class FakeBridge:
@@ -286,6 +288,33 @@ class FakeBridge:
     def flush_volume(self) -> None:
         self.flushed = True
 
+    def read_link(self, parent_lock_bptr: int, name: str):
+        parent = self._locks.get(parent_lock_bptr, self.root)
+        child = parent.children.get(name)
+        if child is None or child.dir_type != ST_SOFTLINK:
+            return None
+        return child.link_target
+
+    def make_link(
+        self,
+        parent_lock_bptr: int,
+        name: str,
+        target: str,
+        soft: bool = True,
+    ):
+        parent = self._locks.get(parent_lock_bptr, self.root)
+        if name in parent.children:
+            return 0, 203  # ERROR_OBJECT_EXISTS
+        if not soft:
+            return 0, -1  # FakeBridge: hard links unsupported
+        node = FakeNode(
+            name=name,
+            dir_type=ST_SOFTLINK,
+            link_target=target,
+        )
+        parent.children[name] = node
+        return 1, 0
+
 
 # ---------------------------------------------------------------------------
 # Test helpers
@@ -416,14 +445,36 @@ class TestCopyFileSingle:
         assert bytes(dst.root.children["file"].data) == b"NEW"
         assert dst.root.children["file"].protection == 0x40
 
-    def test_link_is_skipped(self):
+    def test_soft_link_is_copied_by_default(self):
+        """Phase 7a: soft links are copied via read_link/make_link."""
         src = FakeBridge()
         dst = FakeBridge()
-        src.root.children["link"] = FakeNode(name="link", dir_type=ST_SOFTLINK)
+        src.root.children["link"] = FakeNode(
+            name="link", dir_type=ST_SOFTLINK,
+            link_target="Sys:S/Startup-Sequence",
+        )
 
         stats = copy_file(src, "/link", dst, "/link", atomic=False)
 
         assert stats.files_copied == 0
+        assert stats.links_copied == 1
+        assert stats.links_skipped == 0
+        assert "link" in dst.root.children
+        assert dst.root.children["link"].dir_type == ST_SOFTLINK
+        assert dst.root.children["link"].link_target == "Sys:S/Startup-Sequence"
+
+    def test_soft_link_skipped_when_copy_links_false(self):
+        src = FakeBridge()
+        dst = FakeBridge()
+        src.root.children["link"] = FakeNode(
+            name="link", dir_type=ST_SOFTLINK,
+            link_target="Sys:foo",
+        )
+
+        stats = copy_file(src, "/link", dst, "/link",
+                          atomic=False, copy_links=False)
+
+        assert stats.links_copied == 0
         assert stats.links_skipped == 1
         assert "link" not in dst.root.children
 
@@ -513,7 +564,8 @@ class TestCopyTree:
                 == b";; script\n")
         assert sys_node.children["S"].children["Startup-Sequence"].protection == 0x40
 
-    def test_skips_links_in_tree(self):
+    def test_hard_links_in_tree_are_skipped(self):
+        """Hard links (ST_LINKFILE/ST_LINKDIR) are skipped — MVP scope."""
         src = FakeBridge()
         dst = FakeBridge()
         _add_dir(src, "/d")
@@ -525,6 +577,43 @@ class TestCopyTree:
         stats = copy_tree(src, "/d", dst, "/d", atomic=False)
 
         assert stats.files_copied == 1
+        assert stats.links_skipped == 1
+        assert stats.links_copied == 0
+        assert "link" not in dst.root.children["d"].children
+
+    def test_soft_links_in_tree_are_copied(self):
+        """Soft links are read from src and recreated on dst with same target."""
+        src = FakeBridge()
+        dst = FakeBridge()
+        _add_dir(src, "/d")
+        _add_file(src, "/d/file", b"x")
+        src.root.children["d"].children["link"] = FakeNode(
+            name="link", dir_type=ST_SOFTLINK,
+            link_target="d/file",
+        )
+
+        stats = copy_tree(src, "/d", dst, "/d", atomic=False)
+
+        assert stats.files_copied == 1
+        assert stats.links_copied == 1
+        assert stats.links_skipped == 0
+        link_node = dst.root.children["d"].children["link"]
+        assert link_node.dir_type == ST_SOFTLINK
+        assert link_node.link_target == "d/file"
+
+    def test_copy_links_false_skips_soft_links_in_tree(self):
+        src = FakeBridge()
+        dst = FakeBridge()
+        _add_dir(src, "/d")
+        _add_file(src, "/d/file", b"x")
+        src.root.children["d"].children["link"] = FakeNode(
+            name="link", dir_type=ST_SOFTLINK, link_target="d/file",
+        )
+
+        stats = copy_tree(src, "/d", dst, "/d",
+                          atomic=False, copy_links=False)
+
+        assert stats.links_copied == 0
         assert stats.links_skipped == 1
         assert "link" not in dst.root.children["d"].children
 

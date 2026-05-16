@@ -245,11 +245,17 @@ ACTION_DELETE_OBJECT = 16
 ACTION_RENAME_OBJECT = 17
 ACTION_SET_PROTECT = 21
 ACTION_CREATE_DIR = 22
+ACTION_MAKE_LINK = 24
 ACTION_FLUSH = 27
 ACTION_SET_COMMENT = 28
+ACTION_READ_LINK = 29
 ACTION_FORMAT = 1020
 ACTION_INHIBIT = 31
 ACTION_SET_DATE = 34
+
+# Link types for ACTION_MAKE_LINK
+LINK_HARD = 0
+LINK_SOFT = 1
 OFFSET_BEGINNING = -1
 OFFSET_CURRENT = 0
 OFFSET_END = 1
@@ -1193,6 +1199,53 @@ class HandlerLauncher:
         """
         return self.send_packet(
             state, ACTION_SET_COMMENT, [0, lock_bptr, name_bptr, comment_bptr]
+        )
+
+    def send_make_link(
+        self,
+        state: HandlerLaunchState,
+        lock_bptr: int,
+        name_bptr: int,
+        target_ref: int,
+        link_type: int = LINK_SOFT,
+    ):
+        """ACTION_MAKE_LINK: create a hard or soft link.
+
+        Packet layout: dp_Arg1=parent lock, dp_Arg2=BSTR name,
+        dp_Arg3=target reference, dp_Arg4=link type.
+
+        For soft links (link_type=LINK_SOFT) target_ref is a BSTR BPTR
+        containing the target path string. For hard links (LINK_HARD)
+        target_ref is a BPTR lock on the target object.
+
+        Returns dp_Res1=DOSTRUE/DOSFALSE, dp_Res2=error code.
+        """
+        return self.send_packet(
+            state,
+            ACTION_MAKE_LINK,
+            [lock_bptr, name_bptr, target_ref, link_type],
+        )
+
+    def send_read_link(
+        self,
+        state: HandlerLaunchState,
+        lock_bptr: int,
+        name_bptr: int,
+        buf_addr: int,
+        buf_size: int,
+    ):
+        """ACTION_READ_LINK: read a soft link's target into a host buffer.
+
+        Packet layout: dp_Arg1=parent lock, dp_Arg2=BSTR name,
+        dp_Arg3=buffer address, dp_Arg4=buffer size.
+
+        Returns dp_Res1=length on success (>=0), -1 on failure (and
+        dp_Res2 carries the error code).
+        """
+        return self.send_packet(
+            state,
+            ACTION_READ_LINK,
+            [lock_bptr, name_bptr, buf_addr, buf_size],
         )
 
     def send_set_date(

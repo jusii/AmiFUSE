@@ -1470,6 +1470,90 @@ class HandlerBridge:
                 return 0, -1
             return replies[-1][2], replies[-1][3]
 
+    def make_link(
+        self,
+        parent_lock_bptr: int,
+        name: str,
+        target: str,
+        soft: bool = True,
+    ) -> Tuple[int, int]:
+        """ACTION_MAKE_LINK: create a link at (parent, name) pointing to *target*.
+
+        For soft links (the default), *target* is an Amiga path string and
+        the handler stores it as a BSTR. For hard links, *target* should be
+        the source object's path; we resolve it to a lock internally before
+        the packet send.
+
+        Returns (res1, res2). res1=1 on success.
+        """
+        from .startup_runner import LINK_HARD, LINK_SOFT
+
+        with self._lock:
+            _, name_bptr = self._alloc_bstr(name)
+            if soft:
+                _, target_bptr = self._alloc_bstr(target)
+                target_ref = target_bptr
+                link_type = LINK_SOFT
+            else:
+                # Hard link: resolve target to a lock.
+                target_lock, _, target_locks = self.locate_path(target)
+                if target_lock == 0:
+                    return 0, -1
+                try:
+                    self.launcher.send_make_link(
+                        self.state,
+                        parent_lock_bptr,
+                        name_bptr,
+                        target_lock,
+                        LINK_HARD,
+                    )
+                    replies = self._run_until_replies()
+                    self._log_replies("make_link_hard", replies)
+                finally:
+                    for l in reversed(target_locks):
+                        self.free_lock(l)
+                if not replies:
+                    return 0, -1
+                return replies[-1][2], replies[-1][3]
+
+            self.launcher.send_make_link(
+                self.state, parent_lock_bptr, name_bptr, target_ref, link_type,
+            )
+            replies = self._run_until_replies()
+            self._log_replies("make_link_soft", replies)
+            if not replies:
+                return 0, -1
+            return replies[-1][2], replies[-1][3]
+
+    def read_link(self, parent_lock_bptr: int, name: str) -> Optional[str]:
+        """ACTION_READ_LINK: return the soft-link target string at (parent, name).
+
+        Returns None on failure. The handler writes the target into a
+        host-allocated buffer; we read up to 1024 chars (Amiga max path).
+        """
+        BUF_SIZE = 1024
+        with self._lock:
+            _, name_bptr = self._alloc_bstr(name)
+            buf_mem = self._alloc_read_buf(BUF_SIZE)
+            self.mem.w_block(buf_mem.addr, b"\x00" * BUF_SIZE)
+            self.launcher.send_read_link(
+                self.state, parent_lock_bptr, name_bptr, buf_mem.addr, BUF_SIZE,
+            )
+            replies = self._run_until_replies()
+            self._log_replies("read_link", replies)
+            if not replies:
+                return None
+            length = replies[-1][2]
+            if length < 0:
+                return None
+            # The handler writes a C-style null-terminated string into the
+            # buffer; trust the returned length (capped to buffer size).
+            length = min(length, BUF_SIZE)
+            data = bytes(self.mem.r_block(buf_mem.addr, length))
+            # Drop a trailing NUL if present
+            data = data.rstrip(b"\x00")
+            return data.decode("latin-1", errors="ignore")
+
     def apply_meta_at_path(self, path: str, meta_info) -> None:
         """Apply MetaInfo to *path*; resolves the parent lock internally.
 

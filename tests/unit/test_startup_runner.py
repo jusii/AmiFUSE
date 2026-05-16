@@ -312,8 +312,44 @@ class TestMetaPacketSenders:
             ACTION_SET_PROTECT,
             ACTION_SET_COMMENT,
             ACTION_SET_DATE,
+            ACTION_MAKE_LINK,
+            ACTION_READ_LINK,
+            LINK_HARD,
+            LINK_SOFT,
         )
 
         assert ACTION_SET_PROTECT == 21
         assert ACTION_SET_COMMENT == 28
         assert ACTION_SET_DATE == 34
+        assert ACTION_MAKE_LINK == 24
+        assert ACTION_READ_LINK == 29
+        assert LINK_HARD == 0
+        assert LINK_SOFT == 1
+
+    def test_send_make_link_soft_layout(self):
+        from amifuse.startup_runner import ACTION_MAKE_LINK, LINK_SOFT
+
+        launcher = self._make_launcher()
+        state = self._state()
+
+        launcher.send_make_link(state, 0xDEAD0000, 0xB010, 0xB020, LINK_SOFT)
+
+        launcher.send_packet.assert_called_once_with(
+            state,
+            ACTION_MAKE_LINK,
+            [0xDEAD0000, 0xB010, 0xB020, LINK_SOFT],
+        )
+
+    def test_send_read_link_layout(self):
+        from amifuse.startup_runner import ACTION_READ_LINK
+
+        launcher = self._make_launcher()
+        state = self._state()
+
+        launcher.send_read_link(state, 0xDEAD0000, 0xB010, 0x4000, 1024)
+
+        launcher.send_packet.assert_called_once_with(
+            state,
+            ACTION_READ_LINK,
+            [0xDEAD0000, 0xB010, 0x4000, 1024],
+        )

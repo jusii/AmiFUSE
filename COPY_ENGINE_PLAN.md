@@ -647,8 +647,53 @@ benchmarks reveal.
 
 ### Phase 7: Polish, deferred items
 
-Soft link handling, `.uaefsdb` read provider, `.amiga.json` provider — all
-land as separate small PRs after the core is stable.
+Three items, landed (or explicitly deferred) as separate small PRs:
+
+**7a — Soft link copy (DONE).** `ACTION_MAKE_LINK` (24) and
+`ACTION_READ_LINK` (29) plumbed through HandlerLauncher + HandlerBridge.
+The copy engine reads the source link's target via `read_link` and
+recreates the link on dst via `make_link(..., soft=True)`. Hard links
+(`ST_LINKDIR` / `ST_LINKFILE`) remain skipped — translating a target
+lock across two independent handler images requires a cross-image path
+bridge that's out of scope. `copy_links=True` is the default; pass
+`copy_links=False` to revert to the original warn-and-skip MVP behavior.
+
+**7b — `.amiga.json` provider (DONE).** Per-file JSON sidecar with an
+explicit, lossless schema. Raw FIBF mask and (days, minutes, ticks)
+triple are the source of truth; the human-readable HSPARWED string and
+ISO-ish date are present for editability and ignored on parse. Wired
+into `default_registry()` at priority 30 (after xdfmeta and uaem).
+Unlike `.uaem`, the JSON format preserves sub-second tick precision
+losslessly — it encodes the integer triple directly.
+
+**7c — `.uaefsdb` read provider (DEFERRED, not in scope).**
+WinUAE's binary sidecar format is not implemented. Reasons:
+
+  - The format is undocumented; spec extraction requires reading
+    WinUAE's C++ source for the directory-mount filesystem handler.
+  - The `.uaefsdb` files are a per-volume binary DB with hostname/path
+    fields and per-file records — replicating it correctly without
+    breaking existing WinUAE volumes is a meaningful effort.
+  - The realistic *value* is bounded: any directory-mount user of WinUAE
+    can use FS-UAE's `.uaem` format instead (FS-UAE is strict superset
+    of WinUAE in directory-mount semantics), or convert at extract time.
+  - For the installer pipeline that motivated this work, neither WinUAE
+    nor `.uaefsdb` is in the loop — the build path runs on Linux with
+    AmiFUSE talking to native handlers.
+
+If anyone hits a workflow that needs ingesting an existing WinUAE
+directory tree's `.uaefsdb` metadata, the format can be reverse-engineered
+and a new provider class slotted into the registry without touching the
+engine. The pluggable provider architecture means this is a contained,
+non-blocking gap.
+
+**Performance tuning (deferred to fixture-equipped CI).** The plan
+called for benchmark-driven chunk-size and pipelining tuning. With the
+existing PFS3 fixture this is a one-environment data point at best;
+the meaningful version of this work requires the cross-FS fixture set
+and a representative installer-style workload. Tracked as a follow-up
+for whoever lands FFS/SFS/BFFS fixtures (the cross-FS scaffolding in
+Phase 6 activates automatically once they appear).
 
 ---
 
